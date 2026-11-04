@@ -1,0 +1,1 @@
+fatal: 'feat/log-graph' is already used by worktree at 'C:/Users/matth/AppData/Local/Temp/claude/D--Development-rust-grove/90a4f5e6-f358-4881-a832-ba91681507d8/scratchpad/fx/repo.wt/log-graph'

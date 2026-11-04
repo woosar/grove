@@ -1,0 +1,2 @@
+fatal: cannot remove a locked working tree, lock reason: waiting on CI
+use 'remove -f -f' to override or unlock first

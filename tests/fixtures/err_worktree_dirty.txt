@@ -1,0 +1,1 @@
+fatal: '../repo.wt/log-graph' contains modified or untracked files, use --force to delete it
