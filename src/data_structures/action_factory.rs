@@ -3,8 +3,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Action, Branch, ChangeArea, Commit, FileChange, InternalOp, KeyBinding, Plan, PreflightInfo, PromptKind, Snapshot,
-    Step, Verdict, Worktree,
+    Action, Branch, ChangeArea, Commit, FileChange, InternalOp, KeyBinding, Pipeline, Plan, PreflightInfo, PromptKind,
+    Snapshot, Step, Verdict, Worktree,
 };
 use crate::helpers::{relative_to, short_oid};
 
@@ -41,6 +41,7 @@ const HELP_PUSH: &str = "git push\n\nUploads your branch's new commits to its up
 const HELP_PREVIOUS: &str = "git switch -\n\nSwitches back to the branch you were on before.";
 const HELP_PRUNE_MERGED: &str = "git branch -d <branches…>\n\nDeletes local branches whose commits are all in the main branch. -d still refuses anything unmerged, so nothing is lost. Branches checked out in a worktree are skipped.";
 const HELP_NEW_BRANCH: &str = "git switch -c <name>\n\nCreates a branch at the current commit and switches to it. Uncommitted changes come along.";
+const HELP_PIPELINE: &str = "Run pipeline (grove only)\n\nRuns the saved command lines in order, in a shell (cmd on Windows, sh elsewhere), and stops at the first one that fails. It starts in the root of the active worktree, so relative paths work in every worktree of this repository.\n\nA step that is just `cd <dir>` carries over to the following steps, relative to where the previous step ran; a bare `cd` goes back to the worktree root. `cd x && build` affects only that one line.\n\nCommands can't read input: stdin is closed. Git and the rest of grove stay usable during a run; x cancels it, including whatever it started. Runs aren't journaled and u can't undo them.";
 
 /// Builds every action grove offers, with preflight verdicts from the current snapshot.
 pub struct ActionFactory<'a> {
@@ -495,6 +496,27 @@ impl<'a> ActionFactory<'a> {
             keep.verdict = Verdict::Warn("HEAD is detached — only HEAD moves".into());
         }
         vec![keep, soft, mixed, hard]
+    }
+
+    // ---- pipelines ------------------------------------------------------------------
+
+    pub fn run_pipeline(&self, p: &Pipeline, running: bool) -> Action {
+        let mut action = Action::new(KeyBinding::enter(), "run", Plan::internal(InternalOp::RunPipeline(p.clone())))
+            .explain(p.display())
+            .help(HELP_PIPELINE);
+        if running {
+            action.verdict = Verdict::blocked("a pipeline is already running — x cancels it");
+        } else if p.steps.is_empty() {
+            action.verdict = Verdict::Blocked { reason: "no steps yet — press a to add one".into(), alternative: Some(KeyBinding::ch('a')) };
+        }
+        action
+    }
+
+    pub fn delete_pipeline(&self, p: &Pipeline) -> Action {
+        Action::new(KeyBinding::ch('d'), "delete", Plan::internal(InternalOp::DeletePipeline(p.clone())))
+            .explain(p.display())
+            .destructive()
+            .confirm(format!("Delete pipeline {}?", p.name))
     }
 
     // ---- remote ---------------------------------------------------------------------

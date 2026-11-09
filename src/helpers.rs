@@ -74,6 +74,91 @@ pub fn relative_to(target: &Path, base: &Path) -> String {
     if out.is_empty() { ".".to_string() } else { out.join("/") }
 }
 
+/// `base` joined with `rel`, with `.` and `..` resolved without touching the disk.
+pub fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in base.join(rel).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The target when a pipeline step is nothing but a `cd`: `""` for a bare `cd`. Lines
+/// with shell syntax (`cd x && build`, `cd $HOME`) are left for the shell to run.
+pub fn cd_target(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("cd")?;
+    // `cd..` and `cd\` are valid in cmd; `cdk deploy` is another program
+    if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace() || matches!(c, '.' | '/' | '\\')) {
+        return None;
+    }
+    let mut target = rest.trim();
+    if let Some(after) = target.strip_prefix("/d ").or_else(|| target.strip_prefix("/D ")) {
+        target = after.trim();
+    }
+    if target.contains(['&', '|', ';', '<', '>', '$', '%', '`', '*', '?']) {
+        return None;
+    }
+    for quote in ['"', '\''] {
+        if let Some(inner) = target.strip_prefix(quote).and_then(|t| t.strip_suffix(quote)) {
+            return Some(inner);
+        }
+    }
+    Some(target)
+}
+
+/// Where a `cd` step leads: a bare `cd` returns to the worktree root, anything else is
+/// relative to the current directory.
+pub fn next_dir(root: &Path, dir: &Path, target: &str) -> PathBuf {
+    if target.is_empty() { root.to_path_buf() } else { lexical_join(dir, Path::new(target)) }
+}
+
+/// One line of process output, ready to draw: lossily decoded, without the line ending,
+/// escape sequences or control characters, and showing only the last of any `\r` rewrites.
+pub fn clean_output(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim_end_matches(['\r', '\n']);
+    let text = text.rsplit('\r').next().unwrap_or(text);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters up to a final byte
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ESC \
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn home_tilde(path: &Path) -> String {
     let shown = path.to_string_lossy().replace('\\', "/");
     if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
@@ -576,6 +661,39 @@ mod tests {
     fn base64_matches_reference() {
         assert_eq!(base64(b"grove"), "Z3JvdmU=");
         assert_eq!(base64(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn only_plain_cd_lines_are_sticky() {
+        assert_eq!(cd_target("cd"), Some(""));
+        assert_eq!(cd_target("  cd src/App  "), Some("src/App"));
+        assert_eq!(cd_target("cd.."), Some(".."));
+        assert_eq!(cd_target("cd /d D:\\work"), Some("D:\\work"));
+        assert_eq!(cd_target("cd \"Program Files\""), Some("Program Files"));
+        assert_eq!(cd_target("cd Program Files"), Some("Program Files"));
+        assert_eq!(cd_target("cd x && dotnet build"), None);
+        assert_eq!(cd_target("cd %USERPROFILE%"), None);
+        assert_eq!(cd_target("cdk deploy"), None);
+        assert_eq!(cd_target("dotnet build"), None);
+    }
+
+    #[test]
+    fn cd_paths_resolve_without_the_disk() {
+        let root = Path::new("root");
+        let dir = root.join("a").join("b");
+        assert_eq!(next_dir(root, &dir, ""), root);
+        assert_eq!(next_dir(root, &dir, "../c"), root.join("a").join("c"));
+        assert_eq!(next_dir(root, &dir, "./d"), dir.join("d"));
+    }
+
+    #[test]
+    fn output_is_safe_to_draw() {
+        assert_eq!(clean_output(b"plain\r\n"), "plain");
+        assert_eq!(clean_output(b"\x1b[31;1merror\x1b[0m CS1002\n"), "error CS1002");
+        assert_eq!(clean_output(b"\x1b]0;title\x07ok\n"), "ok");
+        assert_eq!(clean_output(b"10%\r50%\rdone\n"), "done");
+        assert_eq!(clean_output(b"a\tb\x08\n"), "a    b");
+        assert_eq!(clean_output(b"caf\xe9\n"), "caf\u{fffd}");
     }
 
     #[test]

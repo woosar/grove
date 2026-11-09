@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{JournalEntry, JournalFilter};
+use super::{JournalEntry, JournalFilter, Pipeline};
 
 /// Cap for stored stdout/stderr.
 const MAX_OUTPUT: usize = 64 * 1024;
 
-const MIGRATIONS: &[&str] = &["CREATE TABLE entry (
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE entry (
   id            INTEGER PRIMARY KEY,
   started_at    INTEGER NOT NULL,
   duration_ms   INTEGER NOT NULL,
@@ -28,7 +29,15 @@ const MIGRATIONS: &[&str] = &["CREATE TABLE entry (
   parent_id     INTEGER REFERENCES entry(id),
   note          TEXT
 );
-CREATE INDEX entry_repo_time ON entry(repo_root, started_at DESC);"];
+CREATE INDEX entry_repo_time ON entry(repo_root, started_at DESC);",
+    "CREATE TABLE pipeline (
+  id        INTEGER PRIMARY KEY,
+  repo_root TEXT NOT NULL,
+  name      TEXT NOT NULL,
+  steps     TEXT NOT NULL,
+  UNIQUE (repo_root, name)
+);",
+];
 
 const COLUMNS: &str = "id, started_at, duration_ms, repo_root, worktree, branch, via, argv, exit_code, stdout, stderr, head_before, head_after, reflog_before, mutating, parent_id, note";
 
@@ -214,11 +223,55 @@ impl Journal {
         };
         run().unwrap_or_default()
     }
+
+    /// A repository's pipelines, oldest first.
+    pub fn pipelines(&self, repo: &str) -> Vec<Pipeline> {
+        let run = || -> rusqlite::Result<Vec<Pipeline>> {
+            let mut stmt = self.conn.prepare_cached("SELECT id, name, steps FROM pipeline WHERE repo_root = ?1 ORDER BY id")?;
+            let rows = stmt.query_map([repo], |r| {
+                let steps: String = r.get(2)?;
+                Ok(Pipeline { id: r.get(0)?, name: r.get(1)?, steps: serde_json::from_str(&steps).unwrap_or_default() })
+            })?;
+            rows.collect()
+        };
+        run().unwrap_or_default()
+    }
+
+    /// Stores a new, empty pipeline and returns it.
+    pub fn create_pipeline(&self, repo: &str, name: &str) -> Result<Pipeline> {
+        self.conn.execute("INSERT INTO pipeline (repo_root, name, steps) VALUES (?1, ?2, '[]')", params![repo, name])?;
+        Ok(Pipeline { id: self.conn.last_insert_rowid(), name: name.to_string(), steps: Vec::new() })
+    }
+
+    pub fn update_pipeline(&self, p: &Pipeline) -> Result<()> {
+        self.conn.execute("UPDATE pipeline SET name = ?2, steps = ?3 WHERE id = ?1", params![p.id, p.name, serde_json::to_string(&p.steps)?])?;
+        Ok(())
+    }
+
+    pub fn delete_pipeline(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM pipeline WHERE id = ?1", [id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipelines_belong_to_a_repo_and_keep_their_step_order() {
+        let j = Journal::open_in_memory().unwrap();
+        let mut p = j.create_pipeline("/r/.git", "rebuild").unwrap();
+        j.create_pipeline("/other/.git", "rebuild").unwrap();
+        assert!(j.create_pipeline("/r/.git", "rebuild").is_err(), "names are unique per repo");
+        p.steps = vec!["cd src/App".into(), "dotnet clean".into(), "dotnet build".into()];
+        p.name = "full rebuild".into();
+        j.update_pipeline(&p).unwrap();
+        assert_eq!(j.pipelines("/r/.git"), [p.clone()]);
+        j.delete_pipeline(p.id).unwrap();
+        assert!(j.pipelines("/r/.git").is_empty());
+        assert_eq!(j.pipelines("/other/.git").len(), 1);
+    }
 
     fn sample(argv: &[&str], exit: i32, via: &str, mutating: bool) -> JournalEntry {
         JournalEntry {

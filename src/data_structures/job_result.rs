@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::{Commit, CommitDetail, PreflightInfo, RunOutcome, Snapshot};
+use super::{Commit, CommitDetail, PipelineEvent, PreflightInfo, RunOutcome, Snapshot};
 
 /// A finished background job, delivered over the result channel.
 #[derive(Debug)]
@@ -11,4 +11,5 @@ pub enum JobResult {
     LogPage { generation: u64, skip: usize, commits: Vec<Commit>, total: Option<usize> },
     Detail(Box<CommitDetail>),
     Ran(Box<RunOutcome>),
+    Pipeline(PipelineEvent),
 }

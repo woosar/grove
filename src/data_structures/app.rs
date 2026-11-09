@@ -14,8 +14,9 @@ use ratatui::{DefaultTerminal, Frame};
 
 use super::{
     Action, ActionPopup, BranchesScreen, Cli, ConfirmModal, Ctx, DashboardScreen, Effect, ErrorDialog, GroveError, HelpModal,
-    InternalOp, Job, JobResult, Journal, JournalEntry, JournalScreen, KeyBinding, LogScreen, Modal, Pager, Plan, PreflightInfo,
-    PromptKind, PromptModal, QuickSwitcher, RunOutcome, RunRequest, ScreenId, Snapshot, Theme, Verdict, Worker, WorktreesScreen,
+    InternalOp, Job, JobResult, Journal, JournalEntry, JournalScreen, KeyBinding, LogScreen, Modal, Pager, Pipeline, PipelineEvent,
+    PipelineRun, PipelinesScreen, Plan, PreflightInfo, PromptKind, PromptModal, QuickSwitcher, RunOutcome, RunRequest, ScreenId,
+    Snapshot, Theme, Verdict, Worker, WorktreesScreen,
 };
 use crate::helpers::{
     copy_to_clipboard, home_tilde, norm_path, relative_to, same_path, short_oid, str_width, truecolor_supported, truncate,
@@ -38,6 +39,8 @@ macro_rules! ctx {
             tail: &$app.tail,
             last_used: &$app.last_used,
             copy_files: &$app.copy_files,
+            pipelines: &$app.pipelines,
+            pipeline_run: $app.pipeline_run.as_ref(),
         }
     };
 }
@@ -57,6 +60,9 @@ pub struct App {
     branches: BranchesScreen,
     worktrees: WorktreesScreen,
     journal_view: JournalScreen,
+    pipelines_view: PipelinesScreen,
+    pipelines: Vec<Pipeline>,
+    pipeline_run: Option<PipelineRun>,
     modals: Vec<Modal>,
     preflight: HashMap<String, PreflightInfo>,
     preflight_pending: HashSet<String>,
@@ -115,6 +121,9 @@ impl App {
             branches: BranchesScreen::default(),
             worktrees: WorktreesScreen::default(),
             journal_view: JournalScreen::default(),
+            pipelines_view: PipelinesScreen::default(),
+            pipelines: Vec::new(),
+            pipeline_run: None,
             modals: Vec::new(),
             preflight: HashMap::new(),
             preflight_pending: HashSet::new(),
@@ -145,6 +154,7 @@ impl App {
         let result = app.run(&mut terminal);
         let _ = execute!(std::io::stdout(), DisableFocusChange);
         ratatui::restore();
+        app.stop_pipeline();
         result
     }
 
@@ -180,6 +190,7 @@ impl App {
         if let Ok(j) = self.journal.lock() {
             self.tail = j.tail(&repo, 7);
             self.last_used = j.last_used(&repo);
+            self.pipelines = j.pipelines(&repo);
         }
         self.journal_view.needs_reload = true;
     }
@@ -220,6 +231,11 @@ impl App {
         {
             let dirty = self.snap.status.dirty_paths().into_iter().cloned().collect();
             self.worker.send(Job::Preflight { cwd: self.snap.workdir.clone(), target, dirty });
+        }
+        if self.screen == ScreenId::Pipelines
+            && let Some(run) = self.pipeline_run.as_mut().filter(|r| r.finished)
+        {
+            run.seen = true;
         }
         if self.screen == ScreenId::Log {
             for job in self.log.jobs(&self.snap) {
@@ -284,7 +300,84 @@ impl App {
             JobResult::LogPage { generation, skip, commits, total } => self.log.on_page(generation, skip, commits, total),
             JobResult::Detail(detail) => self.log.on_detail(*detail),
             JobResult::Ran(outcome) => self.on_ran(*outcome),
+            JobResult::Pipeline(event) => self.on_pipeline_event(event),
         }
+    }
+
+    fn on_pipeline_event(&mut self, event: PipelineEvent) {
+        let finished = matches!(event, PipelineEvent::Finished);
+        let Some(run) = self.pipeline_run.as_mut() else { return };
+        run.on_event(event);
+        if !finished {
+            return;
+        }
+        let g = &self.theme.g;
+        let secs = run.elapsed().as_secs();
+        let (text, color) = if run.failed() {
+            (format!("{} {} failed after {secs}s", g.cross, run.name), self.theme.err)
+        } else if run.cancelled() {
+            (format!("{} {} cancelled", g.cross, run.name), self.theme.err)
+        } else {
+            (format!("{} {} done in {secs}s", g.check, run.name), self.theme.ok)
+        };
+        self.message(text, color);
+        // the commands may well have changed the working tree
+        self.refresh();
+    }
+
+    fn pipeline_running(&self) -> bool {
+        self.pipeline_run.as_ref().is_some_and(PipelineRun::is_running)
+    }
+
+    fn start_pipeline(&mut self, name: String, steps: Vec<String>) {
+        if self.pipeline_running() {
+            let color = self.theme.err;
+            self.message("a pipeline is already running — x on the Pipelines screen cancels it", color);
+            return;
+        }
+        let run = PipelineRun::new(name, steps, self.snap.workdir.clone());
+        self.worker.send(run.job());
+        self.pipeline_run = Some(run);
+        self.pipelines_view.on_run_started();
+        self.screen = ScreenId::Pipelines;
+        self.message = None;
+    }
+
+    /// Cancels a running pipeline and waits briefly, so quitting leaves no build behind.
+    fn stop_pipeline(&mut self) {
+        let Some(run) = self.pipeline_run.as_ref().filter(|r| r.is_running()) else { return };
+        run.cancel();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.pipeline_running() && Instant::now() < deadline {
+            match self.worker.try_recv() {
+                Some(result) => self.on_result(result),
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// Runs a journal write and picks up the result; `Err` is shown to the user.
+    fn store_pipeline<T>(&mut self, write: impl FnOnce(&Journal, &str) -> Result<T>) -> Option<T> {
+        let repo = self.repo_key();
+        let result = match self.journal.lock() {
+            Ok(j) => write(&j, &repo).map_err(|e| e.to_string()),
+            Err(_) => Err("the journal is unavailable".to_string()),
+        };
+        match result {
+            Ok(value) => {
+                self.reload_journal_data();
+                Some(value)
+            }
+            Err(e) => {
+                let color = self.theme.err;
+                self.message(format!("{} couldn't save the pipeline: {e}", self.theme.g.cross), color);
+                None
+            }
+        }
+    }
+
+    fn name_taken(&self, name: &str, except: i64) -> bool {
+        self.pipelines.iter().any(|p| p.id != except && p.name == name)
     }
 
     fn on_ran(&mut self, outcome: RunOutcome) {
@@ -343,6 +436,7 @@ impl App {
                 ScreenId::Branches => self.branches.handle_key(&key, &ctx),
                 ScreenId::Worktrees => self.worktrees.handle_key(&key, &ctx),
                 ScreenId::Journal => self.journal_view.handle_key(&key),
+                ScreenId::Pipelines => self.pipelines_view.handle_key(&key, &ctx),
             }
         };
         if let Some(e) = effect {
@@ -372,7 +466,7 @@ impl App {
         }
         let f = ctx!(self).actions();
         match c {
-            '1'..='5' => {
+            '1'..='6' => {
                 self.screen = ScreenId::ALL[(c as u8 - b'1') as usize];
                 self.message = None;
             }
@@ -384,10 +478,15 @@ impl App {
             'p' => self.request_run(f.pull(), "p".into(), None),
             'P' => self.request_run(f.push(), "P".into(), None),
             ':' => self.modals.push(Modal::Prompt(PromptModal::new(PromptKind::Raw, ""))),
+            '!' => self.modals.push(Modal::Prompt(PromptModal::new(PromptKind::Shell, ""))),
             '?' => self.open_help(),
             'u' => self.undo(None),
             ']' => self.cycle_tab(1),
             '[' => self.cycle_tab(-1),
+            'q' if self.pipeline_running() => {
+                let color = self.theme.accent;
+                self.message("a pipeline is running — x on the Pipelines screen cancels it, ctrl-c quits and kills it", color);
+            }
             'q' => self.quit = true,
             _ => {}
         }
@@ -404,13 +503,14 @@ impl App {
     fn keymap(&self) -> String {
         let mut out = String::from("Global\n");
         for (k, v) in [
-            ("1–5", "screens"),
+            ("1–6", "screens"),
             ("tab / shift-tab", "cycle panes"),
             ("j/k, arrows", "move"),
             ("space", "actions for the selected item"),
             ("b", "quick switch (fuzzy)"),
             ("f / p / P", "fetch / pull / push"),
             (":", "raw git prompt (journaled)"),
+            ("!", "run a shell command in the worktree root"),
             ("?", "explain the highlighted action"),
             ("u", "undo the last change (reflog)"),
             ("ctrl-tab or ] / [", "cycle worktree tabs"),
@@ -516,6 +616,8 @@ impl App {
                     PromptKind::RenameBranch(b) => b.clone(),
                     PromptKind::MoveWorktree(p) => relative_to(p, &self.snap.workdir),
                     PromptKind::LogFilter => self.log.filter_input(),
+                    PromptKind::RenamePipeline(p) => p.name.clone(),
+                    PromptKind::PipelineStep { pipeline, at, replace: true } => pipeline.steps[*at].clone(),
                     _ => String::new(),
                 };
                 self.modals.push(Modal::Prompt(PromptModal::new(kind, prefill)));
@@ -531,6 +633,43 @@ impl App {
                 self.modals.push(Modal::Popup(ActionPopup::new(title, "pick a mode", actions, None)));
             }
             InternalOp::EditRaw(cmd) => self.modals.push(Modal::Prompt(PromptModal::new(PromptKind::Raw, cmd))),
+            InternalOp::RunPipeline(p) => self.start_pipeline(p.name, p.steps),
+            InternalOp::RunShell(line) => self.start_pipeline(format!("! {line}"), vec![line]),
+            InternalOp::CancelPipeline => match self.pipeline_run.as_ref().filter(|r| r.is_running()) {
+                Some(run) => run.cancel(),
+                None => {
+                    let color = self.theme.dim;
+                    self.message("nothing is running", color);
+                }
+            },
+            InternalOp::CreatePipeline(name) => {
+                if self.name_taken(&name, 0) {
+                    let color = self.theme.err;
+                    self.message(format!("there already is a pipeline called {name}"), color);
+                    return;
+                }
+                if let Some(pipeline) = self.store_pipeline(|j, repo| j.create_pipeline(repo, &name)) {
+                    self.screen = ScreenId::Pipelines;
+                    self.pipelines_view.select(self.pipelines.len().saturating_sub(1));
+                    self.modals.push(Modal::Prompt(PromptModal::new(PromptKind::PipelineStep { pipeline, at: 0, replace: false }, "")));
+                }
+            }
+            InternalOp::SavePipeline { pipeline, next } => {
+                if self.name_taken(&pipeline.name, pipeline.id) {
+                    let color = self.theme.err;
+                    self.message(format!("there already is a pipeline called {}", pipeline.name), color);
+                    return;
+                }
+                if self.store_pipeline(|j, _| j.update_pipeline(&pipeline)).is_some()
+                    && let Some(at) = next
+                {
+                    self.pipelines_view.select_step(at.saturating_sub(1));
+                    self.modals.push(Modal::Prompt(PromptModal::new(PromptKind::PipelineStep { pipeline, at, replace: false }, "")));
+                }
+            }
+            InternalOp::DeletePipeline(p) => {
+                self.store_pipeline(|j, _| j.delete_pipeline(p.id));
+            }
         }
     }
 
@@ -606,6 +745,7 @@ impl App {
             ScreenId::Branches => self.branches.preview(&ctx),
             ScreenId::Worktrees => self.worktrees.preview(&ctx),
             ScreenId::Journal => self.journal_view.preview(&ctx),
+            ScreenId::Pipelines => self.pipelines_view.preview(&ctx),
         }
     }
 
@@ -616,6 +756,7 @@ impl App {
             ScreenId::Branches => self.branches.hints(),
             ScreenId::Worktrees => self.worktrees.hints(),
             ScreenId::Journal => self.journal_view.hints(),
+            ScreenId::Pipelines => self.pipelines_view.hints(),
         }
     }
 
@@ -633,6 +774,7 @@ impl App {
                 ScreenId::Branches => self.branches.draw(f, body, &ctx),
                 ScreenId::Worktrees => self.worktrees.draw(f, body, &ctx),
                 ScreenId::Journal => self.journal_view.draw(f, body, &ctx),
+                ScreenId::Pipelines => self.pipelines_view.draw(f, body, &ctx),
             }
         }
         let screen_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(3));
@@ -682,8 +824,19 @@ impl App {
             left.push(Span::raw("  "));
             left.push(Span::styled(format!("+{untracked} untracked"), t.dimmed()));
         }
+        // a build started earlier stays visible from every screen, and so does its failure
+        if let Some(run) = &self.pipeline_run {
+            if run.is_running() {
+                let spin = g.spinner[self.tick / 2 % g.spinner.len()];
+                left.push(Span::raw("  "));
+                left.push(Span::styled(format!("{spin} {}", truncate(&run.name, 24)), t.s(t.accent)));
+            } else if run.failed() && !run.seen {
+                left.push(Span::raw("  "));
+                left.push(Span::styled(format!("{} {}", g.cross, truncate(&run.name, 24)), t.s(t.err)));
+            }
+        }
         let left_w: usize = left.iter().map(|s| s.width()).sum();
-        let full = (area.width as usize) >= left_w + 64;
+        let full = (area.width as usize) >= left_w + 78;
         let mut right = Vec::new();
         for s in ScreenId::ALL {
             let label = if full || s == self.screen { format!(" {} {} ", s.number(), s.title()) } else { format!(" {} ", s.number()) };
@@ -860,7 +1013,7 @@ mod tests {
                 got = true;
             }
             app.on_tick();
-            let busy = app.queued > 0 || app.applied_seq < app.refresh_seq;
+            let busy = app.queued > 0 || app.applied_seq < app.refresh_seq || app.pipeline_running();
             quiet = if got || busy { 0 } else { quiet + 1 };
             if quiet > 15 {
                 return;
@@ -905,6 +1058,7 @@ mod tests {
             ('3', "Branches · local 3"),
             ('4', "all share one .git"),
             ('5', "Sessions"),
+            ('6', "Pipelines · 0"),
         ] {
             press(&mut app, KeyCode::Char(key));
             settle(&mut app);
@@ -919,7 +1073,7 @@ mod tests {
         let (root, repo) = scenario("small");
         let mut app = app_for(&repo, &root);
         settle(&mut app);
-        for key in ['1', '2', '3', '4', '5'] {
+        for key in ['1', '2', '3', '4', '5', '6'] {
             press(&mut app, KeyCode::Char(key));
             settle(&mut app);
             for (w, h) in [(120, 35), (90, 28), (40, 12)] {
@@ -980,6 +1134,208 @@ mod tests {
         assert!(entries.is_empty(), "git ran: {:?}", entries.iter().map(|e| e.command()).collect::<Vec<_>>());
         assert_eq!(app.tabs.len(), 2, "jumped to the worktree instead");
         assert!(app.snap.workdir.ends_with("log-graph"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `n`, a name, one line per step, an empty line to finish.
+    fn record(app: &mut App, name: &str, steps: &[&str]) {
+        press(app, KeyCode::Char('6'));
+        press(app, KeyCode::Char('n'));
+        typing(app, name);
+        press(app, KeyCode::Enter);
+        for step in steps {
+            typing(app, step);
+            press(app, KeyCode::Enter);
+        }
+        press(app, KeyCode::Enter);
+        assert!(app.modals.is_empty(), "recording didn't end:\n{}", render(app));
+    }
+
+    #[test]
+    fn a_recorded_pipeline_runs_from_the_root_of_whichever_worktree_is_active() {
+        let (root, repo) = scenario("pipeline");
+        let wt = root.join("repo.wt").join("log-graph");
+        for checkout in [&repo, &wt] {
+            std::fs::create_dir_all(checkout.join("src/app")).unwrap();
+            std::fs::create_dir_all(checkout.join("web")).unwrap();
+        }
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        record(&mut app, "rebuild", &["cd src/app", "echo built>built.txt", "cd", "cd web", "echo installed>installed.txt"]);
+
+        // saved, for every worktree of the repo, across restarts
+        drop(app);
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        assert_eq!(app.pipelines[0].steps.len(), 5);
+
+        press(&mut app, KeyCode::Char('6'));
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(repo.join("src/app/built.txt").exists(), "{}", render(&mut app));
+        assert!(repo.join("web/installed.txt").exists());
+        assert!(render(&mut app).contains("done"));
+
+        // same pipeline from the other worktree: relative paths land there instead
+        app.apply_internal(InternalOp::OpenWorktree(wt.clone()));
+        settle(&mut app);
+        assert!(same_path(&app.snap.workdir, &wt));
+        assert_eq!(app.pipelines.len(), 1, "pipelines are shared between worktrees");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(wt.join("src/app/built.txt").exists(), "{}", render(&mut app));
+        assert!(wt.join("web/installed.txt").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Real tools, ignored by default: `cargo test real_dotnet -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs dotnet and pnpm, and network access"]
+    fn real_dotnet_and_pnpm_pipeline() {
+        let (root, repo) = scenario("pipeline-real");
+        std::fs::create_dir_all(repo.join("web")).unwrap();
+        std::fs::write(repo.join("web/package.json"), "{\"name\":\"t\",\"version\":\"1.0.0\"}\n").unwrap();
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        record(
+            &mut app,
+            "rebuild",
+            &[
+                "dotnet new console -o src/App --force",
+                "cd src/App",
+                "dotnet clean",
+                "dotnet build",
+                "cd",
+                "cd web",
+                "pnpm install",
+            ],
+        );
+        press(&mut app, KeyCode::Enter);
+        let started = Instant::now();
+        let mut waited = 0;
+        while app.pipeline_running() && waited < 15_000 {
+            while let Some(r) = app.worker.try_recv() {
+                app.on_result(r);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 1;
+        }
+        settle(&mut app);
+        let screen = render_at(&mut app, 140, 40);
+        println!("{screen}\ntook {:?}", started.elapsed());
+        let run = app.pipeline_run.as_ref().unwrap();
+        assert!(!run.failed() && !run.is_running(), "{screen}");
+        assert!(repo.join("src/App/bin").is_dir(), "built in the solution dir");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failing_step_stops_the_pipeline_and_stays_visible() {
+        let (root, repo) = scenario("pipeline-fail");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        record(&mut app, "bad", &["echo first>first.txt", "exit 3", "echo never>never.txt"]);
+        press(&mut app, KeyCode::Enter);
+        // leave the screen right away: the failure must still show when it ends
+        press(&mut app, KeyCode::Char('1'));
+        settle(&mut app);
+        assert!(repo.join("first.txt").exists());
+        assert!(!repo.join("never.txt").exists(), "ran past the failure");
+        let header = render(&mut app);
+        assert!(header.lines().next().unwrap().contains("✗ bad"), "{header}");
+        press(&mut app, KeyCode::Char('6'));
+        settle(&mut app);
+        let screen = render(&mut app);
+        assert!(screen.contains("exit 3"), "{screen}");
+        assert!(!screen.lines().next().unwrap().contains("✗ bad"), "still flagged after being seen:\n{screen}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_missing_directory_fails_the_cd_step() {
+        let (root, repo) = scenario("pipeline-cd");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        record(&mut app, "lost", &["cd no/such/dir", "echo here>here.txt"]);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(render(&mut app).contains("no such directory"));
+        assert!(!repo.join("here.txt").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_one_off_command_runs_in_the_worktree_root_from_any_screen() {
+        let (root, repo) = scenario("pipeline-oneoff");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('!'));
+        typing(&mut app, "echo hi>hi.txt&& echo visible");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(app.screen, ScreenId::Pipelines);
+        assert!(repo.join("hi.txt").exists());
+        assert!(render(&mut app).contains("visible"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn steps_can_be_edited_reordered_and_removed() {
+        let (root, repo) = scenario("pipeline-edit");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        record(&mut app, "tidy", &["one", "two", "three"]);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(app.pipelines[0].steps, ["two", "one", "three"]);
+        press(&mut app, KeyCode::Enter);
+        typing(&mut app, "!");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pipelines[0].steps, ["two", "one!", "three"]);
+        assert!(app.modals.is_empty(), "editing asks for one line only");
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.pipelines[0].steps, ["two", "three"]);
+
+        // names stay unique, and deleting asks first
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('n'));
+        typing(&mut app, "tidy");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pipelines.len(), 1);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.modals.last(), Some(Modal::Confirm(_))));
+        press(&mut app, KeyCode::Char('Y'));
+        assert!(app.pipelines.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_running_pipeline_blocks_q_and_can_be_cancelled() {
+        let (root, repo) = scenario("pipeline-cancel");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        let sleep = if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30" };
+        record(&mut app, "slow", &[sleep, "echo never>never.txt"]);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pipeline_running());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit, "q must not kill a running build");
+        // starting a second one is refused
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        settle(&mut app);
+        assert!(!app.pipeline_running());
+        assert!(!repo.join("never.txt").exists());
+        assert!(render(&mut app).contains("cancelled"));
+
+        // quitting (ctrl-c) takes a running build down with it
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pipeline_running());
+        app.stop_pipeline();
+        assert!(!app.pipeline_running());
+        assert!(!repo.join("never.txt").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

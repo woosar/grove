@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -6,8 +6,8 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use super::{Action, Ctx, Effect, InternalOp, KeyBinding, Plan, PromptKind, TextInput};
-use crate::helpers::{centered, relative_to, split_shell_words, truncate, wrap_text};
+use super::{Action, Ctx, Effect, InternalOp, KeyBinding, Pipeline, Plan, PromptKind, TextInput};
+use crate::helpers::{cd_target, centered, home_tilde, lexical_join, next_dir, relative_to, split_shell_words, truncate, wrap_text};
 
 /// One-line input whose result becomes a git command (shown live) or a filter.
 pub struct PromptModal {
@@ -80,13 +80,43 @@ impl PromptModal {
                 };
                 Action::new(KeyBinding::ch('L'), "lock", plan).explain("protects it from prune and remove")
             }
-            PromptKind::LogFilter | PromptKind::JournalSearch | PromptKind::OpenRepo => return Ok(None),
+            PromptKind::LogFilter
+            | PromptKind::JournalSearch
+            | PromptKind::OpenRepo
+            | PromptKind::Shell
+            | PromptKind::NewPipeline
+            | PromptKind::RenamePipeline(_)
+            | PromptKind::PipelineStep { .. } => return Ok(None),
         };
         Ok(Some(action))
     }
 
     pub fn preview(&self, ctx: &Ctx) -> Option<Action> {
         self.action(ctx).ok().flatten()
+    }
+
+    /// The line under inputs that don't turn into a git command.
+    fn help(&self, ctx: &Ctx) -> String {
+        let root = &ctx.snap.workdir;
+        match &self.kind {
+            PromptKind::LogFilter => "tokens: path:<dir>  author:<name>  since:2w  code:<text>  — anything else searches messages".to_string(),
+            PromptKind::JournalSearch => "matches command lines, notes and stderr".to_string(),
+            PromptKind::Shell => format!("runs in the worktree root, {}", home_tilde(root)),
+            PromptKind::NewPipeline => "a name for this repo's pipeline, e.g. rebuild; steps are recorded next".to_string(),
+            PromptKind::RenamePipeline(_) => "the new name".to_string(),
+            PromptKind::PipelineStep { pipeline, at, replace } => {
+                let dir = pipeline.dir_at(root, *at);
+                let target = cd_target(&self.input.value);
+                let missing = target.map(|t| next_dir(&lexical_join(root, Path::new("")), &dir, t)).filter(|d| !d.is_dir());
+                let finish = if *replace { "" } else { "  Leave it empty and press enter to finish." };
+                match missing {
+                    Some(d) => format!("{} isn't a directory in this worktree.{finish}", relative_to(&d, root)),
+                    None if target.is_some() => format!("moves the following steps; a bare cd goes back to the root.{finish}"),
+                    None => format!("runs in {}.{finish}", relative_to(&dir, root)),
+                }
+            }
+            _ => "a folder inside a git repository".to_string(),
+        }
     }
 
     fn submit(&self, ctx: &Ctx) -> Option<Effect> {
@@ -96,6 +126,26 @@ impl PromptModal {
             PromptKind::JournalSearch => return Some(Effect::close_then(Effect::SetJournalSearch(v))),
             PromptKind::OpenRepo if !v.is_empty() => {
                 return Some(Effect::close_then(Effect::Internal(InternalOp::OpenWorktree(PathBuf::from(v)))));
+            }
+            PromptKind::Shell if !v.is_empty() => {
+                return Some(Effect::close_then(Effect::Internal(InternalOp::RunShell(v))));
+            }
+            PromptKind::NewPipeline if !v.is_empty() => {
+                return Some(Effect::close_then(Effect::Internal(InternalOp::CreatePipeline(v))));
+            }
+            PromptKind::RenamePipeline(p) if !v.is_empty() => {
+                let pipeline = Pipeline { name: v, ..p.clone() };
+                return Some(Effect::close_then(Effect::Internal(InternalOp::SavePipeline { pipeline, next: None })));
+            }
+            PromptKind::PipelineStep { pipeline, at, replace } if !v.is_empty() => {
+                let mut pipeline = pipeline.clone();
+                if *replace {
+                    pipeline.steps[*at] = v;
+                } else {
+                    pipeline.steps.insert(*at, v);
+                }
+                let next = (!*replace).then_some(*at + 1);
+                return Some(Effect::close_then(Effect::Internal(InternalOp::SavePipeline { pipeline, next })));
             }
             _ => {}
         }
@@ -136,12 +186,9 @@ impl PromptModal {
                 lines.push(Line::from(Span::styled(truncate(&a.explain, inner_w), t.dimmed())));
             }
             Ok(None) => {
-                let help = match self.kind {
-                    PromptKind::LogFilter => "tokens: path:<dir>  author:<name>  since:2w  code:<text>  — anything else searches messages",
-                    PromptKind::JournalSearch => "matches command lines, notes and stderr",
-                    _ => "a folder inside a git repository",
-                };
-                lines.push(Line::from(Span::styled(help, t.dimmed())));
+                for l in wrap_text(&self.help(ctx), inner_w) {
+                    lines.push(Line::from(Span::styled(l, t.dimmed())));
+                }
             }
             Err(e) => lines.push(Line::from(Span::styled(e, t.dimmed()))),
         }

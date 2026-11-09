@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use super::Pipeline;
+
 /// What a one-line text prompt is asking for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptKind {
@@ -15,6 +17,13 @@ pub enum PromptKind {
     LogFilter,
     JournalSearch,
     OpenRepo,
+    /// `!` — runs a shell command in the worktree root.
+    Shell,
+    NewPipeline,
+    RenamePipeline(Pipeline),
+    /// One step of a pipeline: replaces the step at `at`, or inserts there and asks for
+    /// the next one until the input is left empty.
+    PipelineStep { pipeline: Pipeline, at: usize, replace: bool },
 }
 
 impl PromptKind {
@@ -31,6 +40,11 @@ impl PromptKind {
             PromptKind::LogFilter => "Log filter",
             PromptKind::JournalSearch => "Search journal",
             PromptKind::OpenRepo => "Open repository",
+            PromptKind::Shell => "Run command",
+            PromptKind::NewPipeline => "New pipeline",
+            PromptKind::RenamePipeline(_) => "Rename pipeline",
+            PromptKind::PipelineStep { replace: true, .. } => "Edit step",
+            PromptKind::PipelineStep { replace: false, .. } => "Record step",
         }
     }
 }

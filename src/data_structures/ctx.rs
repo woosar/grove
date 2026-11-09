@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::{ActionFactory, JournalEntry, PreflightInfo, Snapshot, Theme};
+use super::{ActionFactory, JournalEntry, Pipeline, PipelineRun, PreflightInfo, Snapshot, Theme};
 
 /// Read-only view of app state handed to screens and modals while drawing and
 /// handling keys.
@@ -15,6 +15,10 @@ pub struct Ctx<'a> {
     pub last_used: &'a HashMap<String, i64>,
     /// Untracked config files offered for copying into new worktrees.
     pub copy_files: &'a [PathBuf],
+    /// This repository's saved pipelines.
+    pub pipelines: &'a [Pipeline],
+    /// The running or most recently finished pipeline.
+    pub pipeline_run: Option<&'a PipelineRun>,
 }
 
 impl<'a> Ctx<'a> {

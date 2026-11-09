@@ -1,13 +1,55 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::{
-    Commit, CommitDetail, ErrorReport, GitOutput, Job, JobResult, Journal, JournalEntry, PreflightInfo, RunOutcome,
-    RunRequest, Snapshot, Step,
+    Commit, CommitDetail, ErrorReport, GitOutput, Job, JobResult, Journal, JournalEntry, PipelineEvent, PreflightInfo,
+    RunOutcome, RunRequest, ShellProcess, Snapshot, Step, StepState,
 };
-use crate::helpers::{is_mutating, local_hms, lossy, norm_path, now_ms, to_string_args};
+use crate::helpers::{cd_target, is_mutating, lexical_join, local_hms, lossy, next_dir, norm_path, now_ms, to_string_args};
+
+/// Runs the steps in order, stopping at the first that doesn't succeed. A step that is
+/// just `cd` moves the following steps; grove handles it, since a shell would forget.
+fn run_pipeline(steps: &[String], root: &Path, cancel: &AtomicBool, tx: &Sender<JobResult>) {
+    let emit = |event| {
+        let _ = tx.send(JobResult::Pipeline(event));
+    };
+    let root = lexical_join(root, Path::new(""));
+    let mut dir = root.clone();
+    for (step, line) in steps.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        emit(PipelineEvent::StepStarted { step, dir: dir.clone() });
+        let state = if let Some(target) = cd_target(line) {
+            let next = next_dir(&root, &dir, target);
+            if next.is_dir() {
+                dir = next;
+                StepState::Done
+            } else {
+                emit(PipelineEvent::Output(format!("no such directory: {}", next.display())));
+                StepState::Failed(None)
+            }
+        } else {
+            match ShellProcess::spawn(line, &dir).and_then(|p| p.wait(cancel, |l| emit(PipelineEvent::Output(l)))) {
+                Ok(Some(0)) => StepState::Done,
+                Ok(_) if cancel.load(Ordering::Relaxed) => StepState::Cancelled,
+                Ok(code) => StepState::Failed(code),
+                Err(e) => {
+                    emit(PipelineEvent::Output(format!("couldn't run it: {e}")));
+                    StepState::Failed(None)
+                }
+            }
+        };
+        emit(PipelineEvent::StepFinished { step, state });
+        if state != StepState::Done {
+            break;
+        }
+    }
+    emit(PipelineEvent::Finished);
+}
 
 /// Background execution. Mutating plans run one at a time on a dedicated thread (two
 /// git operations must never race on one index); reads each get a short-lived thread.
@@ -53,6 +95,10 @@ impl Worker {
             return;
         }
         let tx = self.res_tx.clone();
+        if let Job::Pipeline { steps, root, cancel } = job {
+            thread::spawn(move || run_pipeline(&steps, &root, &cancel, &tx));
+            return;
+        }
         thread::spawn(move || {
             let _ = tx.send(Self::read(job));
         });
@@ -96,7 +142,7 @@ impl Worker {
                 patch.truncate(512 * 1024);
                 JobResult::Detail(Box::new(CommitDetail::parse(&header, &numstat, &names, &contains, &patch, &remotes)))
             }
-            Job::Run(_) => unreachable!("runs go to the mutation thread"),
+            Job::Run(_) | Job::Pipeline { .. } => unreachable!("these run on threads of their own"),
         }
     }
 

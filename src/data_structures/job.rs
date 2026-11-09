@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::RunRequest;
 
@@ -12,4 +14,6 @@ pub enum Job {
     LogPage { cwd: PathBuf, rev_args: Vec<String>, skip: usize, generation: u64, remotes: Vec<String> },
     Detail { cwd: PathBuf, oid: String, remotes: Vec<String> },
     Run(Box<RunRequest>),
+    /// Shell commands, on a thread of their own: a long build must not hold up git.
+    Pipeline { steps: Vec<String>, root: PathBuf, cancel: Arc<AtomicBool> },
 }
