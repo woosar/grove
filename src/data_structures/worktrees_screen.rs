@@ -38,13 +38,14 @@ impl WorktreesScreen {
     }
 
     pub fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        if self.form.is_some() {
-            return vec![("tab", "next field"), ("space", "toggle"), ("⏎", "create"), ("esc", "cancel")];
+        if let Some(form) = &self.form {
+            return form.hints();
         }
         vec![
             ("n", "new"),
             ("⏎", "open"),
             ("x", "remove"),
+            ("X", "force remove"),
             ("p", "prune"),
             ("L", "lock / unlock"),
             ("m", "move"),

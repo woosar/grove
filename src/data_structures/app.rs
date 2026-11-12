@@ -27,6 +27,11 @@ const PROBE_EVERY: Duration = Duration::from_secs(5);
 /// Full reload this often, to catch ref changes `status` doesn't show.
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const MESSAGE_FOR: Duration = Duration::from_secs(6);
+/// Longest wait for input between frames while a pipeline streams output, and otherwise.
+const FRAME_BUSY: Duration = Duration::from_millis(16);
+const FRAME_IDLE: Duration = Duration::from_millis(80);
+/// Input handled before a frame is drawn regardless.
+const MAX_EVENTS_PER_FRAME: usize = 64;
 
 /// Borrow the pieces of `App` that screens read, leaving the screens themselves free
 /// for `&mut` access.
@@ -79,7 +84,8 @@ pub struct App {
     last_refresh: Instant,
     probe_bytes: Vec<u8>,
     probe_pending: bool,
-    tick: usize,
+    /// Clock for the spinner, so it turns at the same pace however often frames come.
+    started: Instant,
     quit: bool,
 }
 
@@ -139,7 +145,7 @@ impl App {
             last_refresh: Instant::now(),
             probe_bytes: Vec::new(),
             probe_pending: false,
-            tick: 0,
+            started: Instant::now(),
             quit: false,
         };
         app.reload_journal_data();
@@ -161,11 +167,22 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
-            if event::poll(Duration::from_millis(80))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
-                    Event::FocusGained => self.refresh(),
-                    _ => {}
+            // streaming output wants frequent frames; idle, a slower beat is plenty
+            let wait = if self.pipeline_running() { FRAME_BUSY } else { FRAME_IDLE };
+            if event::poll(wait)? {
+                // handle everything already queued (key repeat) before the next frame,
+                // so holding a key doesn't fall behind one redraw per press
+                let mut handled = 0;
+                loop {
+                    match event::read()? {
+                        Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
+                        Event::FocusGained => self.refresh(),
+                        _ => {}
+                    }
+                    handled += 1;
+                    if self.quit || handled >= MAX_EVENTS_PER_FRAME || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
                 }
             }
             while let Some(result) = self.worker.try_recv() {
@@ -204,7 +221,6 @@ impl App {
     // ---- background ------------------------------------------------------------------
 
     fn on_tick(&mut self) {
-        self.tick = self.tick.wrapping_add(1);
         let idle = self.queued == 0;
         if idle && !self.probe_pending && self.last_probe.elapsed() >= PROBE_EVERY {
             self.probe_pending = true;
@@ -827,7 +843,7 @@ impl App {
         // a build started earlier stays visible from every screen, and so does its failure
         if let Some(run) = &self.pipeline_run {
             if run.is_running() {
-                let spin = g.spinner[self.tick / 2 % g.spinner.len()];
+                let spin = g.spinner[(self.started.elapsed().as_millis() / 160) as usize % g.spinner.len()];
                 left.push(Span::raw("  "));
                 left.push(Span::styled(format!("{spin} {}", truncate(&run.name, 24)), t.s(t.accent)));
             } else if run.failed() && !run.seen {
@@ -859,7 +875,7 @@ impl App {
         f.render_widget(Paragraph::new(Span::styled("─".repeat(w), t.s(t.border))), rule);
 
         let line = if let Some(cmd) = &self.running {
-            let spin = g.spinner[self.tick / 2 % g.spinner.len()];
+            let spin = g.spinner[(self.started.elapsed().as_millis() / 160) as usize % g.spinner.len()];
             Line::from(vec![
                 Span::styled(format!("{spin} "), t.s(t.accent)),
                 Span::styled("running ", t.dimmed()),
@@ -1370,4 +1386,62 @@ mod tests {
         assert_eq!(journal(&app, false)[0].via, "u");
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn a_dirty_worktree_can_be_force_removed_after_confirming() {
+        let (root, repo) = scenario("force-rm");
+        let wt = root.join("repo.wt").join("log-graph");
+        std::fs::write(wt.join("scratch.txt"), "not committed anywhere
+").unwrap();
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('4'));
+        let at = app.snap.worktrees.iter().position(|w| w.path.ends_with("log-graph")).unwrap();
+        for _ in 0..at {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        // plain remove refuses up front; force asks first, with what is lost
+        let screen = render(&mut app);
+        assert!(screen.contains("has uncommitted work"), "{screen}");
+        press(&mut app, KeyCode::Char('X'));
+        let Some(Modal::Confirm(c)) = app.modals.last() else { panic!("no confirm:
+{}", render(&mut app)) };
+        assert_eq!(c.action.plan.display(&repo), "git worktree remove --force ../repo.wt/log-graph");
+        assert!(c.action.confirm.as_deref().unwrap_or("").contains("1 untracked"), "{:?}", c.action.confirm);
+        // destructive: a plain y isn't enough
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(app.modals.last(), Some(Modal::Confirm(_))));
+        press(&mut app, KeyCode::Char('Y'));
+        settle(&mut app);
+        assert!(!wt.exists(), "{}", render(&mut app));
+        assert_eq!(app.snap.worktrees.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_worktree_form_suggests_branches_that_are_not_checked_out() {
+        let (root, repo) = scenario("wt-pick");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('n'));
+        let screen = render(&mut app);
+        // main is free; feat/journal is checked out here, feat/log-graph in the other worktree
+        // suggestion rows sit under the field, indented past its label
+        assert!(screen.contains("│             main"), "{screen}");
+        assert!(!screen.contains("│             feat/"), "{screen}");
+        typing(&mut app, "mai");
+        let ctrl_n = KeyEvent { code: KeyCode::Char('n'), modifiers: KeyModifiers::CONTROL, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+        app.on_key(ctrl_n);
+        press(&mut app, KeyCode::Enter);
+        // the field now holds the branch; the next Enter checks it out in a new worktree
+        let screen = render(&mut app);
+        assert!(screen.contains("existing"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(app.tabs.len(), 2, "{}", render(&mut app));
+        assert_eq!(app.snap.status.branch.as_deref(), Some("main"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
 }

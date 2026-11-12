@@ -3,6 +3,7 @@ use std::path::Path;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -347,7 +348,7 @@ impl PipelinesScreen {
         // hold the view still while scrolled up and new lines arrive
         let fresh = run.total_lines.saturating_sub(self.drawn_lines);
         if self.scroll_back > 0 {
-            let added: usize = run.output.iter().rev().take(fresh).map(|(_, text)| wrap_text(text, w).len()).sum();
+            let added: usize = run.output.iter().rev().take(fresh).map(|(_, line)| line.wrap(w, Style::default()).len()).sum();
             self.scroll_back = self.scroll_back.saturating_add(added);
         }
         self.drawn_lines = run.total_lines;
@@ -355,13 +356,9 @@ impl PipelinesScreen {
         // only wrap what can be seen: walk backwards until the view is covered
         let wanted = h.saturating_add(self.scroll_back);
         let mut rows: Vec<Line> = Vec::new();
-        for (header, text) in run.output.iter().rev() {
-            let style = if *header { t.s(t.accent) } else { t.text() };
-            // wrapping collapses leading spaces, so only touch lines that need it
-            let wrapped = if str_width(text) <= w { vec![text.clone()] } else { wrap_text(text, w) };
-            for l in wrapped.into_iter().rev() {
-                rows.push(Line::from(Span::styled(l, style)));
-            }
+        for (header, line) in run.output.iter().rev() {
+            let base = if *header { t.s(t.accent) } else { t.text() };
+            rows.extend(line.wrap(w, base).into_iter().rev());
             if rows.len() >= wanted {
                 break;
             }

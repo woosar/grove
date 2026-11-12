@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -11,6 +13,15 @@ use super::{Action, Ctx, Effect, KeyBinding, TextInput};
 use crate::helpers::{pad, relative_to, short_oid, str_width, wrap_text};
 
 const FIELDS: usize = 5;
+/// Existing branches listed under the branch field at most.
+const SUGGESTIONS: usize = 6;
+
+/// An existing branch a worktree can be made for: not checked out anywhere.
+struct Candidate {
+    /// What goes into the branch field (the local name, also for a remote branch).
+    name: String,
+    remote: bool,
+}
 
 /// The "New worktree" form: branch, base, path, and two options. Shows the exact
 /// commands under "will run".
@@ -22,6 +33,12 @@ pub struct WorktreeForm {
     copy: bool,
     open: bool,
     focus: usize,
+    candidates: Vec<Candidate>,
+    /// Candidates matching the branch field, best first.
+    suggestions: Vec<usize>,
+    /// Highlighted suggestion; `None` until ctrl-n / ctrl-p.
+    pick: Option<usize>,
+    matcher: Matcher,
 }
 
 impl WorktreeForm {
@@ -35,9 +52,79 @@ impl WorktreeForm {
             copy: true,
             open: true,
             focus: 0,
+            candidates: Self::candidates(ctx),
+            suggestions: Vec::new(),
+            pick: None,
+            matcher: Matcher::new(Config::DEFAULT),
         };
         form.suggest_path(ctx);
+        form.refilter();
         form
+    }
+
+    /// Local branches no worktree has checked out, then remote branches without a local
+    /// one, each in the snapshot's (recency) order.
+    fn candidates(ctx: &Ctx) -> Vec<Candidate> {
+        let snap = ctx.snap;
+        let checked_out = |name: &str| snap.worktrees.iter().any(|w| w.branch.as_deref() == Some(name));
+        let mut out: Vec<Candidate> =
+            snap.local_branches().filter(|b| !checked_out(&b.name)).map(|b| Candidate { name: b.name.clone(), remote: false }).collect();
+        for b in snap.remote_only() {
+            let name = b.local_name(&snap.remotes);
+            if name != "HEAD" && !out.iter().any(|c| c.name == name) {
+                out.push(Candidate { name: name.to_string(), remote: true });
+            }
+        }
+        out
+    }
+
+    fn refilter(&mut self) {
+        self.pick = None;
+        let query = self.branch.value.trim();
+        // a name that is already complete needs no suggestions
+        if self.candidates.iter().any(|c| c.name == query) {
+            self.suggestions.clear();
+            return;
+        }
+        if query.is_empty() {
+            self.suggestions = (0..self.candidates.len()).take(SUGGESTIONS).collect();
+            return;
+        }
+        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+        let mut buf = Vec::new();
+        let mut scored: Vec<(u32, usize)> = self
+            .candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| pattern.score(Utf32Str::new(&c.name, &mut buf), &mut self.matcher).map(|s| (s, i)))
+            .collect();
+        // best score first; equal scores keep recency order
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        self.suggestions = scored.into_iter().map(|(_, i)| i).take(SUGGESTIONS).collect();
+    }
+
+    /// Moves the highlight through the suggestions; wraps around and starts at the top.
+    fn move_pick(&mut self, down: bool) {
+        let n = self.suggestions.len();
+        if n == 0 {
+            return;
+        }
+        self.pick = Some(match (self.pick, down) {
+            (None, true) => 0,
+            (None, false) => n - 1,
+            (Some(p), true) => (p + 1) % n,
+            (Some(p), false) => (p + n - 1) % n,
+        });
+    }
+
+    /// Hints for the bottom bar while the form is open.
+    pub fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = vec![("tab", "next field")];
+        if self.focus == 0 && !self.suggestions.is_empty() {
+            out.push(("ctrl-n/p", "pick branch"));
+        }
+        out.extend([("space", "toggle"), ("⏎", "create"), ("esc", "cancel")]);
+        out
     }
 
     fn suggest_path(&mut self, ctx: &Ctx) {
@@ -100,6 +187,25 @@ impl WorktreeForm {
     }
 
     pub fn handle_key(&mut self, key: &KeyEvent, ctx: &Ctx) -> Option<Effect> {
+        if self.focus == 0 {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Char('n') if ctrl => return self.picked(true),
+                KeyCode::Char('p') if ctrl => return self.picked(false),
+                KeyCode::Down if alt => return self.picked(true),
+                KeyCode::Up if alt => return self.picked(false),
+                KeyCode::Enter if self.pick.is_some() => {
+                    if let Some(c) = self.pick.and_then(|p| self.suggestions.get(p)).map(|&i| &self.candidates[i]) {
+                        self.branch.set(c.name.clone());
+                        self.suggest_path(ctx);
+                    }
+                    self.refilter();
+                    return Some(Effect::Nothing);
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1) % FIELDS,
             KeyCode::BackTab | KeyCode::Up => self.focus = (self.focus + FIELDS - 1) % FIELDS,
@@ -112,7 +218,10 @@ impl WorktreeForm {
                 });
             }
             _ => match self.focus {
-                0 if self.branch.handle(key) => self.suggest_path(ctx),
+                0 if self.branch.handle(key) => {
+                    self.suggest_path(ctx);
+                    self.refilter();
+                }
                 1 => {
                     self.base.handle(key);
                 }
@@ -120,6 +229,11 @@ impl WorktreeForm {
                 _ => {}
             },
         }
+        Some(Effect::Nothing)
+    }
+
+    fn picked(&mut self, down: bool) -> Option<Effect> {
+        self.move_pick(down);
         Some(Effect::Nothing)
     }
 
@@ -161,8 +275,20 @@ impl WorktreeForm {
             ])
         };
         let files: Vec<String> = self.copy_files(ctx).iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
-        let mut lines = vec![
-            input("branch", &self.branch, 0, kind.to_string()),
+        let mut lines = vec![input("branch", &self.branch, 0, kind.to_string())];
+        if self.focus == 0 && !self.suggestions.is_empty() {
+            for (row, &i) in self.suggestions.iter().enumerate() {
+                let c = &self.candidates[i];
+                let picked = self.pick == Some(row);
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(10)),
+                    Span::styled(format!("{} ", if picked { g.pointer } else { " " }), t.s(t.accent)),
+                    Span::styled(c.name.clone(), if picked { t.bold(t.branch) } else { t.s(t.branch) }),
+                    Span::styled(if c.remote { "  remote" } else { "" }, t.dimmed()),
+                ]));
+            }
+        }
+        lines.extend([
             Line::raw(""),
             input("from", &self.base, 1, if kind == "new" { base_oid } else { "—".into() }),
             Line::raw(""),
@@ -172,7 +298,7 @@ impl WorktreeForm {
             checkbox(self.open, 4, "open in a new grove tab when done".into(), String::new()),
             Line::from(Span::styled("─".repeat(w), t.s(t.border))),
             Line::from(Span::styled("will run", t.dimmed())),
-        ];
+        ]);
         match self.action(ctx) {
             Ok(a) => {
                 for step in &a.plan.steps {

@@ -4,11 +4,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use ratatui::style::Style;
+
 use super::{
     Commit, CommitDetail, ErrorReport, GitOutput, Job, JobResult, Journal, JournalEntry, PipelineEvent, PreflightInfo,
-    RunOutcome, RunRequest, ShellProcess, Snapshot, Step, StepState,
+    RunOutcome, RunRequest, ShellProcess, Snapshot, Step, StepState, StyledLine,
 };
-use crate::helpers::{cd_target, is_mutating, lexical_join, local_hms, lossy, next_dir, norm_path, now_ms, to_string_args};
+use crate::helpers::{cd_target, force_console_color, is_mutating, lexical_join, local_hms, lossy, next_dir, norm_path, now_ms, to_string_args};
 
 /// Runs the steps in order, stopping at the first that doesn't succeed. A step that is
 /// just `cd` moves the following steps; grove handles it, since a shell would forget.
@@ -29,16 +31,16 @@ fn run_pipeline(steps: &[String], root: &Path, cancel: &AtomicBool, tx: &Sender<
                 dir = next;
                 StepState::Done
             } else {
-                emit(PipelineEvent::Output(format!("no such directory: {}", next.display())));
+                emit(PipelineEvent::Output(StyledLine::plain(format!("no such directory: {}", next.display()), Style::default())));
                 StepState::Failed(None)
             }
         } else {
-            match ShellProcess::spawn(line, &dir).and_then(|p| p.wait(cancel, |l| emit(PipelineEvent::Output(l)))) {
+            match ShellProcess::spawn(&force_console_color(line), &dir).and_then(|p| p.wait(cancel, |l| emit(PipelineEvent::Output(l)))) {
                 Ok(Some(0)) => StepState::Done,
                 Ok(_) if cancel.load(Ordering::Relaxed) => StepState::Cancelled,
                 Ok(code) => StepState::Failed(code),
                 Err(e) => {
-                    emit(PipelineEvent::Output(format!("couldn't run it: {e}")));
+                    emit(PipelineEvent::Output(StyledLine::plain(format!("couldn't run it: {e}"), Style::default())));
                     StepState::Failed(None)
                 }
             }

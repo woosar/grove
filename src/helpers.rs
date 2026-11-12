@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
@@ -118,45 +119,24 @@ pub fn next_dir(root: &Path, dir: &Path, target: &str) -> PathBuf {
     if target.is_empty() { root.to_path_buf() } else { lexical_join(dir, Path::new(target)) }
 }
 
-/// One line of process output, ready to draw: lossily decoded, without the line ending,
-/// escape sequences or control characters, and showing only the last of any `\r` rewrites.
-pub fn clean_output(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    let text = text.trim_end_matches(['\r', '\n']);
-    let text = text.rsplit('\r').next().unwrap_or(text);
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => match chars.next() {
-                // CSI: parameters up to a final byte
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: up to BEL or ESC \
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\x07' {
-                            break;
-                        }
-                        if c == '\x1b' {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\t' => out.push_str("    "),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
+/// MSBuild (`dotnet build` and friends) colors through the console API, which a pipe
+/// never sees; `-clp:ForceConsoleColor` makes it write ANSI colors instead. Added only to
+/// a line that is a single such command without console logger options of its own.
+pub fn force_console_color(line: &str) -> Cow<'_, str> {
+    const VERBS: [&str; 8] = ["build", "test", "publish", "pack", "restore", "clean", "msbuild", "rebuild"];
+    let lower = line.trim().to_ascii_lowercase();
+    let mut words = lower.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let msbuild = match first.trim_end_matches(".exe") {
+        "dotnet" => words.next().is_some_and(|v| VERBS.contains(&v)),
+        "msbuild" => true,
+        _ => false,
+    };
+    let chained = lower.contains(['&', '|']);
+    let has_own = ["-clp", "/clp", "-consoleloggerparameters", "--consoleloggerparameters", "/consoleloggerparameters"]
+        .iter()
+        .any(|o| lower.split_whitespace().any(|w| w.starts_with(o)));
+    if msbuild && !chained && !has_own { Cow::Owned(format!("{} -clp:ForceConsoleColor", line.trim_end())) } else { Cow::Borrowed(line) }
 }
 
 pub fn home_tilde(path: &Path) -> String {
@@ -687,13 +667,14 @@ mod tests {
     }
 
     #[test]
-    fn output_is_safe_to_draw() {
-        assert_eq!(clean_output(b"plain\r\n"), "plain");
-        assert_eq!(clean_output(b"\x1b[31;1merror\x1b[0m CS1002\n"), "error CS1002");
-        assert_eq!(clean_output(b"\x1b]0;title\x07ok\n"), "ok");
-        assert_eq!(clean_output(b"10%\r50%\rdone\n"), "done");
-        assert_eq!(clean_output(b"a\tb\x08\n"), "a    b");
-        assert_eq!(clean_output(b"caf\xe9\n"), "caf\u{fffd}");
+    fn msbuild_is_asked_for_colors() {
+        assert_eq!(force_console_color("dotnet build"), "dotnet build -clp:ForceConsoleColor");
+        assert_eq!(force_console_color("dotnet test -c Release "), "dotnet test -c Release -clp:ForceConsoleColor");
+        assert_eq!(force_console_color("msbuild app.sln"), "msbuild app.sln -clp:ForceConsoleColor");
+        assert_eq!(force_console_color("dotnet run"), "dotnet run");
+        assert_eq!(force_console_color("dotnet build && dotnet test"), "dotnet build && dotnet test");
+        assert_eq!(force_console_color("dotnet build -clp:NoSummary"), "dotnet build -clp:NoSummary");
+        assert_eq!(force_console_color("cargo build"), "cargo build");
     }
 
     #[test]

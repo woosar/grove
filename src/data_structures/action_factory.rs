@@ -24,6 +24,9 @@ const HELP_OPEN_WT: &str = "Open worktree (grove only)\n\nMakes that worktree gr
 const HELP_PRUNE: &str = "git worktree prune --verbose\n\nRemoves git's administrative records for worktrees whose directories no longer exist (e.g. deleted with a file manager instead of `git worktree remove`). While such a record exists its branch counts as checked out and can't be checked out anywhere else.\n\nOnly the records go; branches and commits stay.";
 const HELP_LOCK: &str = "git worktree lock --reason <why> <path> / git worktree unlock <path>\n\nA locked worktree is protected from `git worktree prune` and `remove` — useful for checkouts on removable drives or long CI runs.";
 const HELP_REMOVE_WT: &str = "git worktree remove <path>\n\nDeletes the worktree's directory and git's record of it. Refuses if the worktree has modified or untracked files, or is locked. The branch it had checked out stays.";
+const HELP_FORCE_REMOVE_WT: &str = "git worktree remove --force <path>
+
+Deletes the worktree's directory even though it has modified or untracked files; those files exist nowhere else and are gone for good. A locked worktree needs --force twice. The branch it had checked out stays.";
 const HELP_MOVE_WT: &str = "git worktree move <path> <new-path>\n\nMoves a worktree's directory and updates git's records. The main worktree and locked worktrees can't be moved.";
 const HELP_STAGE: &str = "git add -- <path> / git restore --staged -- <path>\n\nStaging puts the file's current content into the index, so the next commit includes it. Unstaging takes it back out of the index; your edits in the file are untouched.";
 const HELP_COMMIT: &str = "git commit -m <message>\n\nRecords everything staged as a new commit on the current branch.\n\nUndo: `git reset --soft HEAD~1` keeps the changes staged; grove's u uses `git reset --keep <HEAD before>`.";
@@ -41,7 +44,9 @@ const HELP_PUSH: &str = "git push\n\nUploads your branch's new commits to its up
 const HELP_PREVIOUS: &str = "git switch -\n\nSwitches back to the branch you were on before.";
 const HELP_PRUNE_MERGED: &str = "git branch -d <branches…>\n\nDeletes local branches whose commits are all in the main branch. -d still refuses anything unmerged, so nothing is lost. Branches checked out in a worktree are skipped.";
 const HELP_NEW_BRANCH: &str = "git switch -c <name>\n\nCreates a branch at the current commit and switches to it. Uncommitted changes come along.";
-const HELP_PIPELINE: &str = "Run pipeline (grove only)\n\nRuns the saved command lines in order, in a shell (cmd on Windows, sh elsewhere), and stops at the first one that fails. It starts in the root of the active worktree, so relative paths work in every worktree of this repository.\n\nA step that is just `cd <dir>` carries over to the following steps, relative to where the previous step ran; a bare `cd` goes back to the worktree root. `cd x && build` affects only that one line.\n\nCommands can't read input: stdin is closed. Git and the rest of grove stay usable during a run; x cancels it, including whatever it started. Runs aren't journaled and u can't undo them.";
+const HELP_PIPELINE: &str = "Run pipeline (grove only)\n\nRuns the saved command lines in order, in a shell (cmd on Windows, sh elsewhere), and stops at the first one that fails. It starts in the root of the active worktree, so relative paths work in every worktree of this repository.\n\nA step that is just `cd <dir>` carries over to the following steps, relative to where the previous step ran; a bare `cd` goes back to the worktree root. `cd x && build` affects only that one line.\n\nCommands can't read input: stdin is closed. Git and the rest of grove stay usable during a run; x cancels it, including whatever it started. Runs aren't journaled and u can't undo them.
+
+Colors: tools are asked for colored output (FORCE_COLOR, CLICOLOR_FORCE, CARGO_TERM_COLOR), and a plain `dotnet build`/`test`/`publish`… line gets -clp:ForceConsoleColor, since MSBuild otherwise colors only a real console.";
 
 /// Builds every action grove offers, with preflight verdicts from the current snapshot.
 pub struct ActionFactory<'a> {
@@ -384,6 +389,34 @@ impl<'a> ActionFactory<'a> {
             Verdict::Ok
         };
 
+        let mut force_args = vec!["worktree", "remove", "--force"];
+        if wt.locked.is_some() {
+            force_args.push("--force");
+        }
+        force_args.push(&rel);
+        let mut lost = Vec::new();
+        if let Some(d) = wt.dirty.filter(|d| !d.is_clean()) {
+            lost.push(format!("Its uncommitted work is deleted for good: {}.", d.describe()));
+        }
+        if let Some(reason) = &wt.locked {
+            lost.push(if reason.is_empty() { "It is locked.".to_string() } else { format!("It is locked: \"{reason}\".") });
+        }
+        let mut force = Action::new(KeyBinding::ch('X'), "force rm", Plan::git(&force_args))
+            .explain("deletes the worktree directory even with uncommitted work or a lock; its branch stays")
+            .note("deletes uncommitted work")
+            .help(HELP_FORCE_REMOVE_WT)
+            .destructive()
+            .confirm(format!("Force-remove {rel}? {}", if lost.is_empty() { "Nothing uncommitted is lost.".to_string() } else { lost.join(" ") }));
+        force.verdict = if wt.is_main {
+            Verdict::blocked("the main worktree can't be removed")
+        } else if here {
+            Verdict::blocked("you're in it — open another worktree first")
+        } else if wt.prunable.is_some() {
+            Verdict::Blocked { reason: "the directory is already gone — prune instead".into(), alternative: Some(KeyBinding::ch('p')) }
+        } else {
+            Verdict::Ok
+        };
+
         let mut mv = Action::new(KeyBinding::ch('m'), "move", Plan::internal(InternalOp::Prompt(PromptKind::MoveWorktree(wt.path.clone()))))
             .explain("moves the worktree directory (asks for the new path)")
             .help(HELP_MOVE_WT);
@@ -393,7 +426,7 @@ impl<'a> ActionFactory<'a> {
             mv.verdict = Verdict::blocked("locked — unlock first");
         }
 
-        if wt.prunable.is_some() { vec![prune, open, lock, remove, mv] } else { vec![open, prune, lock, remove, mv] }
+        if wt.prunable.is_some() { vec![prune, open, lock, remove, force, mv] } else { vec![open, prune, lock, remove, force, mv] }
     }
 
     // ---- status ---------------------------------------------------------------------

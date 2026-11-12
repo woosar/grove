@@ -6,7 +6,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::helpers::clean_output;
+use ratatui::style::Style;
+
+use super::StyledLine;
 
 const POLL: Duration = Duration::from_millis(50);
 /// How long to keep reading after the shell exits. Build tools leave servers behind
@@ -17,8 +19,12 @@ const PIPE_GRACE: Duration = Duration::from_millis(500);
 /// One command line running in the platform's shell, with its output streamed as lines.
 pub struct ShellProcess {
     child: Child,
-    lines: Receiver<String>,
+    lines: Receiver<StyledLine>,
 }
+
+/// Asks the usual tools for colors even though their output goes into a pipe.
+const FORCE_COLOR: [(&str, &str); 4] =
+    [("FORCE_COLOR", "1"), ("CLICOLOR_FORCE", "1"), ("CARGO_TERM_COLOR", "always"), ("DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION", "1")];
 
 /// `cmd` runs in a console of its own (nothing can scribble over the TUI) set to UTF-8,
 /// so programs that follow the console code page produce output grove can decode. Only
@@ -42,15 +48,17 @@ fn shell(line: &str) -> Command {
     cmd
 }
 
-fn pump(stream: impl Read + Send + 'static, tx: Sender<String>) {
+/// Each stream keeps its own color state, as two terminals would.
+fn pump(stream: impl Read + Send + 'static, tx: Sender<StyledLine>) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stream);
         let mut buf = Vec::new();
+        let mut style = Style::default();
         loop {
             buf.clear();
             match reader.read_until(b'\n', &mut buf) {
                 Ok(n) if n > 0 => {
-                    if tx.send(clean_output(&buf)).is_err() {
+                    if tx.send(StyledLine::parse(&buf, &mut style)).is_err() {
                         break;
                     }
                 }
@@ -63,7 +71,7 @@ fn pump(stream: impl Read + Send + 'static, tx: Sender<String>) {
 impl ShellProcess {
     pub fn spawn(line: &str, cwd: &Path) -> std::io::Result<ShellProcess> {
         let mut child =
-            shell(line).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+            shell(line).envs(FORCE_COLOR).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let (tx, lines) = channel();
         if let Some(stdout) = child.stdout.take() {
             pump(stdout, tx.clone());
@@ -97,7 +105,7 @@ impl ShellProcess {
 
     /// Hands over output lines until the shell exits or `cancel` is set, and returns the
     /// exit code (`None` when killed by a signal).
-    pub fn wait(mut self, cancel: &AtomicBool, mut on_line: impl FnMut(String)) -> std::io::Result<Option<i32>> {
+    pub fn wait(mut self, cancel: &AtomicBool, mut on_line: impl FnMut(StyledLine)) -> std::io::Result<Option<i32>> {
         let mut killed = false;
         let status = loop {
             match self.lines.recv_timeout(POLL) {
@@ -131,7 +139,7 @@ mod tests {
     fn run(line: &str) -> (Option<i32>, Vec<String>) {
         let cancel = AtomicBool::new(false);
         let mut out = Vec::new();
-        let code = ShellProcess::spawn(line, &std::env::temp_dir()).unwrap().wait(&cancel, |l| out.push(l)).unwrap();
+        let code = ShellProcess::spawn(line, &std::env::temp_dir()).unwrap().wait(&cancel, |l| out.push(l.text())).unwrap();
         (code, out)
     }
 

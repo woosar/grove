@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{Job, PipelineEvent, StepState};
+use ratatui::style::Style;
+
+use super::{Job, PipelineEvent, StepState, StyledLine};
 use crate::helpers::relative_to;
 
 /// Output lines kept for scrolling; a long build drops its oldest lines first.
@@ -18,7 +20,7 @@ pub struct PipelineRun {
     /// The worktree it started in.
     pub root: PathBuf,
     /// `(is a step header, text)`
-    pub output: VecDeque<(bool, String)>,
+    pub output: VecDeque<(bool, StyledLine)>,
     /// Lines received over the whole run, including dropped ones.
     pub total_lines: usize,
     pub finished: bool,
@@ -75,11 +77,11 @@ impl PipelineRun {
         self.states.iter().filter(|s| **s == StepState::Done).count()
     }
 
-    fn push(&mut self, header: bool, text: String) {
+    fn push(&mut self, header: bool, line: StyledLine) {
         if self.output.len() == MAX_LINES {
             self.output.pop_front();
         }
-        self.output.push_back((header, text));
+        self.output.push_back((header, line));
         self.total_lines += 1;
     }
 
@@ -89,14 +91,14 @@ impl PipelineRun {
                 self.states[step] = StepState::Running;
                 let at = relative_to(&dir, &self.root);
                 let at = if at == "." { String::new() } else { format!("{at} ") };
-                self.push(true, format!("{at}$ {}", self.steps[step]));
+                self.push(true, StyledLine::plain(format!("{at}$ {}", self.steps[step]), Style::default()));
             }
             PipelineEvent::Output(line) => self.push(false, line),
             PipelineEvent::StepFinished { step, state } => {
                 self.states[step] = state;
                 match state {
-                    StepState::Failed(Some(code)) => self.push(true, format!("exit {code}")),
-                    StepState::Cancelled => self.push(true, "cancelled".to_string()),
+                    StepState::Failed(Some(code)) => self.push(true, StyledLine::plain(format!("exit {code}"), Style::default())),
+                    StepState::Cancelled => self.push(true, StyledLine::plain("cancelled", Style::default())),
                     _ => {}
                 }
             }

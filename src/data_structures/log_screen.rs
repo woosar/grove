@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -7,6 +10,12 @@ use ratatui::widgets::Paragraph;
 
 use super::{Action, ActionPopup, Commit, CommitDetail, Ctx, Effect, GraphRow, Job, KeyBinding, LaneAllocator, LogFilter, Modal, Plan, PromptKind, PromptModal, Snapshot};
 use crate::helpers::{keep_visible, local_date_long, nav, pad, pad_left, relative_age_long, short_oid, str_width, wrap_text};
+
+/// The selection has to rest this long before its detail is loaded; holding j would
+/// otherwise start five git processes per commit passed.
+const DETAIL_SETTLE: Duration = Duration::from_millis(120);
+/// Loaded details kept for moving back and forth.
+const DETAIL_CACHE: usize = 64;
 
 /// Screen 2: the full log with graph, filter, commit detail and file preview.
 pub struct LogScreen {
@@ -28,6 +37,11 @@ pub struct LogScreen {
     keep_oid: Option<String>,
     detail: Option<CommitDetail>,
     detail_requested: Option<String>,
+    /// Details already loaded, by oid.
+    details: HashMap<String, CommitDetail>,
+    /// When `sel` last changed (`last_sel` is what it was then).
+    sel_changed: Instant,
+    last_sel: usize,
     anchor: Option<Rect>,
     page: usize,
 }
@@ -52,6 +66,9 @@ impl Default for LogScreen {
             keep_oid: None,
             detail: None,
             detail_requested: None,
+            details: HashMap::new(),
+            sel_changed: Instant::now(),
+            last_sel: 0,
             anchor: None,
             page: 20,
         }
@@ -90,6 +107,8 @@ impl LogScreen {
             self.requested = None;
             self.detail = None;
             self.detail_requested = None;
+            // refs and "contained in" may have moved
+            self.details.clear();
         }
         if snap.status.oid.is_none() {
             self.exhausted = true;
@@ -107,12 +126,20 @@ impl LogScreen {
                 remotes: snap.remotes.clone(),
             });
         }
+        if self.sel != self.last_sel {
+            self.last_sel = self.sel;
+            self.sel_changed = Instant::now();
+        }
         if let Some(c) = self.commits.get(self.sel)
             && self.detail.as_ref().is_none_or(|d| d.oid != c.oid)
-            && self.detail_requested.as_deref() != Some(&c.oid)
         {
-            self.detail_requested = Some(c.oid.clone());
-            jobs.push(Job::Detail { cwd, oid: c.oid.clone(), remotes: snap.remotes.clone() });
+            if let Some(d) = self.details.get(&c.oid) {
+                self.file_sel = self.file_sel.min(d.files.len().saturating_sub(1));
+                self.detail = Some(d.clone());
+            } else if self.detail_requested.as_deref() != Some(&c.oid) && self.sel_changed.elapsed() >= DETAIL_SETTLE {
+                self.detail_requested = Some(c.oid.clone());
+                jobs.push(Job::Detail { cwd, oid: c.oid.clone(), remotes: snap.remotes.clone() });
+            }
         }
         jobs
     }
@@ -143,6 +170,10 @@ impl LogScreen {
     }
 
     pub fn on_detail(&mut self, detail: CommitDetail) {
+        if self.details.len() >= DETAIL_CACHE {
+            self.details.clear();
+        }
+        self.details.insert(detail.oid.clone(), detail.clone());
         if self.commits.get(self.sel).is_some_and(|c| c.oid == detail.oid) {
             self.file_sel = self.file_sel.min(detail.files.len().saturating_sub(1));
             self.detail = Some(detail);
