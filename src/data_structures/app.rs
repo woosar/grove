@@ -1426,21 +1426,40 @@ mod tests {
         press(&mut app, KeyCode::Char('4'));
         press(&mut app, KeyCode::Char('n'));
         let screen = render(&mut app);
-        // main is free; feat/journal is checked out here, feat/log-graph in the other worktree
-        // suggestion rows sit under the field, indented past its label
-        assert!(screen.contains("│             main"), "{screen}");
-        assert!(!screen.contains("│             feat/"), "{screen}");
+        // opens in "existing branch" mode listing only free branches: main is free;
+        // feat/journal is checked out here, feat/log-graph in the other worktree
+        assert!(screen.contains("◉ existing branch"), "{screen}");
+        assert!(screen.contains("▸ main"), "{screen}");
+        assert!(screen.contains(" 1/1"), "{screen}");
+        assert!(screen.contains("git worktree add ../repo.wt/main main"), "{screen}");
+        // typing filters; Enter checks out the selected branch in a new worktree
         typing(&mut app, "mai");
-        let ctrl_n = KeyEvent { code: KeyCode::Char('n'), modifiers: KeyModifiers::CONTROL, kind: KeyEventKind::Press, state: KeyEventState::NONE };
-        app.on_key(ctrl_n);
-        press(&mut app, KeyCode::Enter);
-        // the field now holds the branch; the next Enter checks it out in a new worktree
-        let screen = render(&mut app);
-        assert!(screen.contains("existing"), "{screen}");
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
         assert_eq!(app.tabs.len(), 2, "{}", render(&mut app));
         assert_eq!(app.snap.status.branch.as_deref(), Some("main"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_worktree_form_creates_a_new_branch_in_new_mode() {
+        let (root, repo) = scenario("wt-new");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('n'));
+        typing(&mut app, "feat/fresh");
+        // no free branch matches, so existing mode has nothing to create
+        assert!(render(&mut app).contains("no free branch matches"));
+        let ctrl_t = KeyEvent { code: KeyCode::Char('t'), modifiers: KeyModifiers::CONTROL, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+        app.on_key(ctrl_t);
+        let screen = render(&mut app);
+        assert!(screen.contains("◉ new branch"), "{screen}");
+        assert!(screen.contains("git worktree add -b feat/fresh ../repo.wt/fresh feat/journal"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(app.tabs.len(), 2, "{}", render(&mut app));
+        assert_eq!(app.snap.status.branch.as_deref(), Some("feat/fresh"));
         let _ = std::fs::remove_dir_all(root);
     }
 
