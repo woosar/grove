@@ -19,7 +19,7 @@ use super::{
     Snapshot, Theme, Verdict, Worker, WorktreesScreen,
 };
 use crate::helpers::{
-    copy_to_clipboard, home_tilde, norm_path, relative_to, same_path, short_oid, str_width, truecolor_supported, truncate,
+    copy_to_clipboard, diff_file_name, home_tilde, norm_path, relative_to, same_path, short_oid, str_width, truecolor_supported, truncate,
 };
 
 /// Poll `git status` this often while idle.
@@ -32,6 +32,8 @@ const FRAME_BUSY: Duration = Duration::from_millis(16);
 const FRAME_IDLE: Duration = Duration::from_millis(80);
 /// Input handled before a frame is drawn regardless.
 const MAX_EVENTS_PER_FRAME: usize = 64;
+/// Finished pipeline runs kept around for their output.
+const MAX_FINISHED_RUNS: usize = 8;
 
 /// Borrow the pieces of `App` that screens read, leaving the screens themselves free
 /// for `&mut` access.
@@ -45,7 +47,7 @@ macro_rules! ctx {
             last_used: &$app.last_used,
             copy_files: &$app.copy_files,
             pipelines: &$app.pipelines,
-            pipeline_run: $app.pipeline_run.as_ref(),
+            pipeline_runs: &$app.pipeline_runs,
         }
     };
 }
@@ -67,7 +69,9 @@ pub struct App {
     journal_view: JournalScreen,
     pipelines_view: PipelinesScreen,
     pipelines: Vec<Pipeline>,
-    pipeline_run: Option<PipelineRun>,
+    /// Runs going on and recently finished, oldest first.
+    pipeline_runs: Vec<PipelineRun>,
+    next_run_id: u64,
     modals: Vec<Modal>,
     preflight: HashMap<String, PreflightInfo>,
     preflight_pending: HashSet<String>,
@@ -129,7 +133,8 @@ impl App {
             journal_view: JournalScreen::default(),
             pipelines_view: PipelinesScreen::default(),
             pipelines: Vec::new(),
-            pipeline_run: None,
+            pipeline_runs: Vec::new(),
+            next_run_id: 0,
             modals: Vec::new(),
             preflight: HashMap::new(),
             preflight_pending: HashSet::new(),
@@ -160,7 +165,7 @@ impl App {
         let result = app.run(&mut terminal);
         let _ = execute!(std::io::stdout(), DisableFocusChange);
         ratatui::restore();
-        app.stop_pipeline();
+        app.stop_pipelines();
         result
     }
 
@@ -249,7 +254,8 @@ impl App {
             self.worker.send(Job::Preflight { cwd: self.snap.workdir.clone(), target, dirty });
         }
         if self.screen == ScreenId::Pipelines
-            && let Some(run) = self.pipeline_run.as_mut().filter(|r| r.finished)
+            && let Some(id) = self.pipelines_view.viewed(&ctx!(self)).filter(|r| r.finished).map(|r| r.id)
+            && let Some(run) = self.pipeline_runs.iter_mut().find(|r| r.id == id)
         {
             run.seen = true;
         }
@@ -316,13 +322,32 @@ impl App {
             JobResult::LogPage { generation, skip, commits, total } => self.log.on_page(generation, skip, commits, total),
             JobResult::Detail(detail) => self.log.on_detail(*detail),
             JobResult::Ran(outcome) => self.on_ran(*outcome),
-            JobResult::Pipeline(event) => self.on_pipeline_event(event),
+            JobResult::Pipeline { run, event } => self.on_pipeline_event(run, event),
+            JobResult::DiffFile { path, result } => self.on_diff_file(path, result),
         }
     }
 
-    fn on_pipeline_event(&mut self, event: PipelineEvent) {
+    fn on_diff_file(&mut self, path: PathBuf, result: Result<usize, String>) {
+        let g = &self.theme.g;
+        match result {
+            Ok(lines) => {
+                let text = path.to_string_lossy().into_owned();
+                copy_to_clipboard(&text);
+                let msg = format!("{} wrote {} ({lines} lines) — path copied", g.check, home_tilde(&path));
+                let color = self.theme.ok;
+                self.message(msg, color);
+            }
+            Err(e) => {
+                let msg = format!("{} couldn't write the diff: {e}", g.cross);
+                let color = self.theme.err;
+                self.message(msg, color);
+            }
+        }
+    }
+
+    fn on_pipeline_event(&mut self, id: u64, event: PipelineEvent) {
         let finished = matches!(event, PipelineEvent::Finished);
-        let Some(run) = self.pipeline_run.as_mut() else { return };
+        let Some(run) = self.pipeline_runs.iter_mut().find(|r| r.id == id) else { return };
         run.on_event(event);
         if !finished {
             return;
@@ -342,27 +367,41 @@ impl App {
     }
 
     fn pipeline_running(&self) -> bool {
-        self.pipeline_run.as_ref().is_some_and(PipelineRun::is_running)
+        self.pipeline_runs.iter().any(PipelineRun::is_running)
     }
 
+    /// Starts a run next to any others; the same pipeline runs once per worktree at a time.
     fn start_pipeline(&mut self, name: String, steps: Vec<String>) {
-        if self.pipeline_running() {
+        let root = self.snap.workdir.clone();
+        let same = |r: &PipelineRun| r.name == name && same_path(&r.root, &root);
+        if self.pipeline_runs.iter().any(|r| r.is_running() && same(r)) {
             let color = self.theme.err;
-            self.message("a pipeline is already running — x on the Pipelines screen cancels it", color);
+            self.message(format!("{name} is already running in this worktree — x on the Pipelines screen cancels it"), color);
             return;
         }
-        let run = PipelineRun::new(name, steps, self.snap.workdir.clone());
+        // a new run replaces the last one of the same pipeline here
+        self.pipeline_runs.retain(|r| r.is_running() || !same(r));
+        while self.pipeline_runs.iter().filter(|r| !r.is_running()).count() >= MAX_FINISHED_RUNS {
+            let Some(oldest) = self.pipeline_runs.iter().position(|r| !r.is_running()) else { break };
+            self.pipeline_runs.remove(oldest);
+        }
+        self.next_run_id += 1;
+        let run = PipelineRun::new(self.next_run_id, name, steps, root);
         self.worker.send(run.job());
-        self.pipeline_run = Some(run);
-        self.pipelines_view.on_run_started();
+        self.pipelines_view.on_run_started(run.id);
+        self.pipeline_runs.push(run);
         self.screen = ScreenId::Pipelines;
         self.message = None;
     }
 
-    /// Cancels a running pipeline and waits briefly, so quitting leaves no build behind.
-    fn stop_pipeline(&mut self) {
-        let Some(run) = self.pipeline_run.as_ref().filter(|r| r.is_running()) else { return };
-        run.cancel();
+    /// Cancels every running pipeline and waits briefly, so quitting leaves no build behind.
+    fn stop_pipelines(&mut self) {
+        if !self.pipeline_running() {
+            return;
+        }
+        for run in self.pipeline_runs.iter().filter(|r| r.is_running()) {
+            run.cancel();
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.pipeline_running() && Instant::now() < deadline {
             match self.worker.try_recv() {
@@ -499,6 +538,8 @@ impl App {
             'u' => self.undo(None),
             ']' => self.cycle_tab(1),
             '[' => self.cycle_tab(-1),
+            'H' => self.request_run(f.reset_hard_head(), "H".into(), None),
+            'C' => self.request_run(f.clean_untracked(), "C".into(), None),
             'q' if self.pipeline_running() => {
                 let color = self.theme.accent;
                 self.message("a pipeline is running — x on the Pipelines screen cancels it, ctrl-c quits and kills it", color);
@@ -529,6 +570,8 @@ impl App {
             ("!", "run a shell command in the worktree root"),
             ("?", "explain the highlighted action"),
             ("u", "undo the last change (reflog)"),
+            ("H", "git reset --hard HEAD (asks first)"),
+            ("C", "git clean -fd (asks first)"),
             ("ctrl-tab or ] / [", "cycle worktree tabs"),
             ("esc", "close"),
             ("q", "quit"),
@@ -651,7 +694,7 @@ impl App {
             InternalOp::EditRaw(cmd) => self.modals.push(Modal::Prompt(PromptModal::new(PromptKind::Raw, cmd))),
             InternalOp::RunPipeline(p) => self.start_pipeline(p.name, p.steps),
             InternalOp::RunShell(line) => self.start_pipeline(format!("! {line}"), vec![line]),
-            InternalOp::CancelPipeline => match self.pipeline_run.as_ref().filter(|r| r.is_running()) {
+            InternalOp::CancelPipeline(id) => match self.pipeline_runs.iter().find(|r| r.id == id && r.is_running()) {
                 Some(run) => run.cancel(),
                 None => {
                     let color = self.theme.dim;
@@ -685,6 +728,13 @@ impl App {
             }
             InternalOp::DeletePipeline(p) => {
                 self.store_pipeline(|j, _| j.delete_pipeline(p.id));
+            }
+            InternalOp::WriteDiff { from, to } => {
+                let cwd = self.snap.workdir.clone();
+                let path = cwd.join(diff_file_name(&from, &to));
+                let color = self.theme.accent;
+                self.message(format!("writing {}…", home_tilde(&path)), color);
+                self.worker.send(Job::DiffFile { cwd, from, to, path });
             }
         }
     }
@@ -840,16 +890,19 @@ impl App {
             left.push(Span::raw("  "));
             left.push(Span::styled(format!("+{untracked} untracked"), t.dimmed()));
         }
-        // a build started earlier stays visible from every screen, and so does its failure
-        if let Some(run) = &self.pipeline_run {
-            if run.is_running() {
-                let spin = g.spinner[(self.started.elapsed().as_millis() / 160) as usize % g.spinner.len()];
-                left.push(Span::raw("  "));
-                left.push(Span::styled(format!("{spin} {}", truncate(&run.name, 24)), t.s(t.accent)));
-            } else if run.failed() && !run.seen {
-                left.push(Span::raw("  "));
-                left.push(Span::styled(format!("{} {}", g.cross, truncate(&run.name, 24)), t.s(t.err)));
-            }
+        // builds started earlier stay visible from every screen, and so do their failures
+        let running: Vec<&PipelineRun> = self.pipeline_runs.iter().filter(|r| r.is_running()).collect();
+        if !running.is_empty() {
+            let spin = g.spinner[(self.started.elapsed().as_millis() / 160) as usize % g.spinner.len()];
+            let what = if running.len() == 1 { truncate(&running[0].name, 24) } else { format!("{} pipelines", running.len()) };
+            left.push(Span::raw("  "));
+            left.push(Span::styled(format!("{spin} {what}"), t.s(t.accent)));
+        }
+        let failed: Vec<&PipelineRun> = self.pipeline_runs.iter().filter(|r| r.finished && r.failed() && !r.seen).collect();
+        if !failed.is_empty() {
+            let what = if failed.len() == 1 { truncate(&failed[0].name, 24) } else { format!("{} failed", failed.len()) };
+            left.push(Span::raw("  "));
+            left.push(Span::styled(format!("{} {what}", g.cross), t.s(t.err)));
         }
         let left_w: usize = left.iter().map(|s| s.width()).sum();
         let full = (area.width as usize) >= left_w + 78;
@@ -1032,6 +1085,19 @@ mod tests {
             let busy = app.queued > 0 || app.applied_seq < app.refresh_seq || app.pipeline_running();
             quiet = if got || busy { 0 } else { quiet + 1 };
             if quiet > 15 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Pumps results until the latest snapshot is in, without waiting for pipelines.
+    fn settle_snapshot(app: &mut App) {
+        for _ in 0..500 {
+            while let Some(r) = app.worker.try_recv() {
+                app.on_result(r);
+            }
+            if app.applied_seq >= app.refresh_seq {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1239,7 +1305,7 @@ mod tests {
         settle(&mut app);
         let screen = render_at(&mut app, 140, 40);
         println!("{screen}\ntook {:?}", started.elapsed());
-        let run = app.pipeline_run.as_ref().unwrap();
+        let run = app.pipeline_runs.last().unwrap();
         assert!(!run.failed() && !run.is_running(), "{screen}");
         assert!(repo.join("src/App/bin").is_dir(), "built in the solution dir");
         let _ = std::fs::remove_dir_all(root);
@@ -1349,7 +1415,7 @@ mod tests {
         // quitting (ctrl-c) takes a running build down with it
         press(&mut app, KeyCode::Enter);
         assert!(app.pipeline_running());
-        app.stop_pipeline();
+        app.stop_pipelines();
         assert!(!app.pipeline_running());
         assert!(!repo.join("never.txt").exists());
         let _ = std::fs::remove_dir_all(root);
@@ -1406,7 +1472,7 @@ mod tests {
         press(&mut app, KeyCode::Char('X'));
         let Some(Modal::Confirm(c)) = app.modals.last() else { panic!("no confirm:
 {}", render(&mut app)) };
-        assert_eq!(c.action.plan.display(&repo), "git worktree remove --force ../repo.wt/log-graph");
+        assert_eq!(c.action.plan.display(&repo), "git worktree remove --force ../repo.wt/log-graph && clean up ../repo.wt/log-graph");
         assert!(c.action.confirm.as_deref().unwrap_or("").contains("1 untracked"), "{:?}", c.action.confirm);
         // destructive: a plain y isn't enough
         press(&mut app, KeyCode::Char('y'));
@@ -1414,7 +1480,146 @@ mod tests {
         press(&mut app, KeyCode::Char('Y'));
         settle(&mut app);
         assert!(!wt.exists(), "{}", render(&mut app));
+        // the container directory was left empty, so it goes too
+        assert!(!root.join("repo.wt").exists());
+        assert!(root.exists() && repo.exists());
         assert_eq!(app.snap.worktrees.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn leftovers_of_a_removed_worktree_are_deleted_but_nothing_above_the_repo() {
+        let root = std::env::temp_dir().join(format!("grove-leftover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wt = root.join("repo.wt").join("feat").join("x");
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/out.bin"), "held open on Windows").unwrap();
+        std::fs::create_dir_all(root.join("repo.wt").join("other")).unwrap();
+        crate::helpers::remove_leftover_dir(&wt, &root).unwrap();
+        assert!(!wt.exists());
+        assert!(!root.join("repo.wt/feat").exists(), "empty parent stays");
+        assert!(root.join("repo.wt/other").exists(), "a sibling went too");
+        // never at or above the stop
+        crate::helpers::remove_leftover_dir(&root, &root).unwrap();
+        crate::helpers::remove_leftover_dir(root.parent().unwrap(), &root).unwrap();
+        assert!(root.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn different_pipelines_run_side_by_side_but_each_once_per_worktree() {
+        let (root, repo) = scenario("pipeline-parallel");
+        let wt = root.join("repo.wt").join("log-graph");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        let sleep = if cfg!(windows) { "ping -n 3 127.0.0.1 >nul" } else { "sleep 2" };
+        record(&mut app, "one", &[sleep, "echo one>one.txt"]);
+        record(&mut app, "two", &[sleep, "echo two>two.txt"]);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pipeline_runs.iter().filter(|r| r.is_running()).count(), 2, "{}", render(&mut app));
+        assert!(render(&mut app).lines().next().unwrap().contains("2 pipelines"));
+        // the same one again, here: refused
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pipeline_runs.len(), 2);
+        // ...but it may run in another worktree meanwhile
+        app.apply_internal(InternalOp::OpenWorktree(wt.clone()));
+        settle_snapshot(&mut app);
+        press(&mut app, KeyCode::Char('6'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pipeline_runs.iter().filter(|r| r.is_running()).count(), 3, "{}", render(&mut app));
+        settle(&mut app);
+        assert!(repo.join("one.txt").exists() && repo.join("two.txt").exists());
+        assert!(wt.join("two.txt").exists());
+        assert!(app.pipeline_runs.iter().all(|r| !r.failed()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn x_cancels_only_the_run_on_screen() {
+        let (root, repo) = scenario("pipeline-cancel-one");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        let (slow, quick) = if cfg!(windows) { ("ping -n 30 127.0.0.1", "ping -n 3 127.0.0.1 >nul") } else { ("sleep 30", "sleep 2") };
+        record(&mut app, "slow", &[slow, "echo never>never.txt"]);
+        record(&mut app, "quick", &[quick, "echo done>done.txt"]);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        // back on "slow": the output follows the selection, and x cancels that run only
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('x'));
+        settle(&mut app);
+        assert!(!repo.join("never.txt").exists());
+        assert!(repo.join("done.txt").exists(), "{}", render(&mut app));
+        let slow_run = app.pipeline_runs.iter().find(|r| r.name == "slow").unwrap();
+        assert!(slow_run.cancelled());
+        assert!(!app.pipeline_runs.iter().find(|r| r.name == "quick").unwrap().cancelled());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn h_and_c_reset_and_clean_after_a_red_confirm() {
+        let (root, repo) = scenario("quick-cmds");
+        std::fs::write(repo.join("junk.txt"), "untracked").unwrap();
+        std::fs::create_dir_all(repo.join("junkdir")).unwrap();
+        std::fs::write(repo.join("junkdir/x.txt"), "untracked").unwrap();
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('H'));
+        let Some(Modal::Confirm(c)) = app.modals.last() else { panic!("no confirm:\n{}", render(&mut app)) };
+        assert_eq!(c.action.plan.display(&repo), "git reset --hard HEAD");
+        press(&mut app, KeyCode::Char('Y'));
+        settle(&mut app);
+        assert_eq!(std::fs::read_to_string(repo.join("Cargo.toml")).unwrap(), "[package]\nversion = \"0.2.9\"\n");
+        assert!(repo.join("junk.txt").exists(), "reset --hard leaves untracked files");
+
+        press(&mut app, KeyCode::Char('C'));
+        let Some(Modal::Confirm(c)) = app.modals.last() else { panic!("no confirm:\n{}", render(&mut app)) };
+        assert_eq!(c.action.plan.display(&repo), "git clean -fd");
+        press(&mut app, KeyCode::Char('Y'));
+        settle(&mut app);
+        assert!(!repo.join("junk.txt").exists() && !repo.join("junkdir").exists());
+
+        // clean tree: both are blocked and never reach git
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('C'));
+        assert!(app.modals.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_marked_commits_give_a_diff_file() {
+        let (root, repo) = scenario("diff-file");
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('2'));
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.modals.is_empty());
+        // newest and oldest commit of the log
+        press(&mut app, KeyCode::Char('g'));
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('G'));
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('v'));
+        assert!(render(&mut app).contains("D diff file"));
+        press(&mut app, KeyCode::Char('D'));
+        settle(&mut app);
+        let file = std::fs::read_dir(&repo)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("grove-diff-"))
+            .unwrap_or_else(|| panic!("no diff file:\n{}", render(&mut app)));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("diff --git"), "{text}");
+        // older → newer: the files added since the root commit show as added
+        assert!(text.contains("+++ b/"), "{text}");
+        assert!(!text.contains("deleted file"), "diffed the wrong way round:\n{text}");
         let _ = std::fs::remove_dir_all(root);
     }
 

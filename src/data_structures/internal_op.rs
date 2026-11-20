@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::{Pipeline, PromptKind, ScreenId};
-use crate::helpers::relative_to;
+use crate::helpers::{diff_file_name, relative_to, short_oid as short};
 
 /// Something grove does itself, without running git.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,12 +22,15 @@ pub enum InternalOp {
     RunPipeline(Pipeline),
     /// One command from the `!` prompt, run like a one-step pipeline.
     RunShell(String),
-    CancelPipeline,
+    /// Cancel the run with this id.
+    CancelPipeline(u64),
     /// Create an empty pipeline and start recording its steps.
     CreatePipeline(String),
     /// Store changed steps or a new name; `next` keeps recording at that step index.
     SavePipeline { pipeline: Pipeline, next: Option<usize> },
     DeletePipeline(Pipeline),
+    /// Write `git diff from to` to a file in the worktree root.
+    WriteDiff { from: String, to: String },
 }
 
 impl InternalOp {
@@ -45,10 +48,11 @@ impl InternalOp {
             InternalOp::EditRaw(cmd) => format!("open the : prompt with `git {cmd}`"),
             InternalOp::RunPipeline(p) => format!("run pipeline {}", p.name),
             InternalOp::RunShell(line) => format!("run `{line}`"),
-            InternalOp::CancelPipeline => "cancel the running pipeline".to_string(),
+            InternalOp::CancelPipeline(_) => "cancel the pipeline run".to_string(),
             InternalOp::CreatePipeline(name) => format!("create pipeline {name}"),
             InternalOp::SavePipeline { pipeline, .. } => format!("save pipeline {}", pipeline.name),
             InternalOp::DeletePipeline(p) => format!("delete pipeline {}", p.name),
+            InternalOp::WriteDiff { from, to } => format!("write git diff {} {} to {}", short(from), short(to), diff_file_name(from, to)),
         }
     }
 }

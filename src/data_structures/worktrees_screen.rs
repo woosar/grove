@@ -4,7 +4,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::{Action, ActionPopup, Ctx, Effect, Modal, Verdict, Worktree, WorktreeForm};
+use super::{Action, ActionPopup, Ctx, Effect, Modal, Step, Verdict, Worktree, WorktreeForm};
 use crate::helpers::{home_tilde, keep_visible, nav, norm_path, pad, relative_age_long, short_oid, str_width, truncate, wrap_text};
 
 /// Screen 4: all worktrees, the selected one's state and actions, and the new-worktree form.
@@ -239,7 +239,14 @@ impl WorktreesScreen {
         for a in ctx.actions().worktree_actions(wt) {
             let blocked = a.verdict.is_blocked();
             let chip = if blocked { t.key_dim(a.key.label(g)) } else { t.key(a.key.label(g)) };
-            let text = if a.plan.is_internal() { a.explain.clone() } else { a.plan.display(&ctx.snap.workdir) };
+            // just the git commands: the clean-up step would push the notes out of view
+            let text = if a.plan.is_internal() {
+                a.explain.clone()
+            } else {
+                let git: Vec<String> =
+                    a.plan.steps.iter().filter(|s| matches!(s, Step::Git(_))).map(|s| s.display(&ctx.snap.workdir)).collect();
+                git.join(" && ")
+            };
             let mut spans = vec![chip, Span::styled(format!(" {}", pad(a.label, 9)), t.text())];
             spans.push(Span::styled(text.clone(), if blocked || a.plan.is_internal() { t.dimmed() } else { t.s(t.accent) }));
             let room = w.saturating_sub(13 + str_width(&text));

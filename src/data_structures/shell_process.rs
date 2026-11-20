@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ const PIPE_GRACE: Duration = Duration::from_millis(500);
 /// One command line running in the platform's shell, with its output streamed as lines.
 pub struct ShellProcess {
     child: Child,
-    lines: Receiver<StyledLine>,
+    lines: Receiver<Piece>,
 }
 
 /// Asks the usual tools for colors even though their output goes into a pipe.
@@ -48,22 +48,57 @@ fn shell(line: &str) -> Command {
     cmd
 }
 
-/// Each stream keeps its own color state, as two terminals would.
-fn pump(stream: impl Read + Send + 'static, tx: Sender<StyledLine>) {
+/// What a stream produced: a finished line, or the line written so far (a progress
+/// counter, a prompt) that later output replaces.
+enum Piece {
+    Line(StyledLine),
+    Partial(StyledLine),
+}
+
+/// An unfinished line is cut back to its last carriage return once it grows this long,
+/// so a progress bar that never ends its line can't grow without bound.
+const MAX_PENDING: usize = 16 * 1024;
+const LF: u8 = 0x0a;
+const CR: u8 = 0x0d;
+
+/// Reads whatever arrives, without waiting for line ends: finished lines go out as they
+/// come, the rest as a partial line that is shown right away. Each stream keeps its own
+/// color state, as two terminals would.
+fn pump(mut stream: impl Read + Send + 'static, tx: Sender<Piece>) {
     thread::spawn(move || {
-        let mut reader = BufReader::new(stream);
-        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut pending: Vec<u8> = Vec::new();
         let mut style = Style::default();
         loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(n) if n > 0 => {
-                    if tx.send(StyledLine::parse(&buf, &mut style)).is_err() {
-                        break;
-                    }
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            pending.extend_from_slice(&chunk[..n]);
+            let mut start = 0;
+            while let Some(i) = pending[start..].iter().position(|b| *b == LF) {
+                let end = start + i + 1;
+                if tx.send(Piece::Line(StyledLine::parse(&pending[start..end], &mut style))).is_err() {
+                    return;
                 }
-                _ => break,
+                start = end;
             }
+            pending.drain(..start);
+            if pending.len() > MAX_PENDING
+                && let Some(r) = pending.iter().rposition(|b| *b == CR).filter(|&r| r > 0)
+            {
+                pending.drain(..r);
+            }
+            if !pending.is_empty() {
+                // the style only moves on once the line is finished
+                let mut peek = style;
+                if tx.send(Piece::Partial(StyledLine::parse(&pending, &mut peek))).is_err() {
+                    return;
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let _ = tx.send(Piece::Line(StyledLine::parse(&pending, &mut style)));
         }
     });
 }
@@ -103,28 +138,47 @@ impl ShellProcess {
         let _ = self.child.kill();
     }
 
-    /// Hands over output lines until the shell exits or `cancel` is set, and returns the
-    /// exit code (`None` when killed by a signal).
-    pub fn wait(mut self, cancel: &AtomicBool, mut on_line: impl FnMut(StyledLine)) -> std::io::Result<Option<i32>> {
+    /// Hands over output until the shell exits or `cancel` is set, and returns the exit
+    /// code (`None` when killed by a signal). `on_output` gets each line and whether it is
+    /// a partial one that the next output replaces.
+    pub fn wait(mut self, cancel: &AtomicBool, mut on_output: impl FnMut(StyledLine, bool)) -> std::io::Result<Option<i32>> {
+        let mut deliver = |piece: Piece| match piece {
+            Piece::Line(l) => on_output(l, false),
+            Piece::Partial(l) => on_output(l, true),
+        };
         let mut killed = false;
+        let mut checked = Instant::now();
         let status = loop {
-            match self.lines.recv_timeout(POLL) {
-                Ok(line) => on_line(line),
-                Err(RecvTimeoutError::Timeout) => {}
+            let idle = match self.lines.recv_timeout(POLL) {
+                Ok(piece) => {
+                    deliver(piece);
+                    // a flood of output is passed on in one go, without a syscall per line
+                    while let Ok(piece) = self.lines.try_recv() {
+                        deliver(piece);
+                    }
+                    false
+                }
+                Err(RecvTimeoutError::Timeout) => true,
                 // both streams closed while the process lives on
-                Err(RecvTimeoutError::Disconnected) => thread::sleep(POLL),
-            }
+                Err(RecvTimeoutError::Disconnected) => {
+                    thread::sleep(POLL);
+                    true
+                }
+            };
             if !killed && cancel.load(Ordering::Relaxed) {
                 killed = true;
                 self.kill_tree();
             }
-            if let Some(status) = self.child.try_wait()? {
-                break status;
+            if idle || killed || checked.elapsed() >= POLL {
+                checked = Instant::now();
+                if let Some(status) = self.child.try_wait()? {
+                    break status;
+                }
             }
         };
         let deadline = Instant::now() + PIPE_GRACE;
-        while let Ok(line) = self.lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            on_line(line);
+        while let Ok(piece) = self.lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            deliver(piece);
         }
         Ok(status.code())
     }
@@ -139,7 +193,7 @@ mod tests {
     fn run(line: &str) -> (Option<i32>, Vec<String>) {
         let cancel = AtomicBool::new(false);
         let mut out = Vec::new();
-        let code = ShellProcess::spawn(line, &std::env::temp_dir()).unwrap().wait(&cancel, |l| out.push(l.text())).unwrap();
+        let code = ShellProcess::spawn(line, &std::env::temp_dir()).unwrap().wait(&cancel, |l, partial| if !partial { out.push(l.text()) }).unwrap();
         (code, out)
     }
 
@@ -149,6 +203,30 @@ mod tests {
         assert_eq!(code, Some(3));
         assert!(out.iter().any(|l| l.contains("to-out")), "{out:?}");
         assert!(out.iter().any(|l| l.contains("to-err")), "{out:?}");
+    }
+
+    #[test]
+    fn an_unfinished_line_shows_before_its_line_end() {
+        // a prompt-like line without a line end, while the process is still running
+        let line = if cfg!(windows) { "<nul set /p =working... & ping -n 3 127.0.0.1 >nul & echo  done" } else { "printf working...; sleep 2; echo ' done'" };
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let mut first_partial = None;
+        let mut lines = Vec::new();
+        ShellProcess::spawn(line, &std::env::temp_dir())
+            .unwrap()
+            .wait(&cancel, |l, partial| {
+                if partial {
+                    first_partial.get_or_insert((l.text(), started.elapsed()));
+                } else {
+                    lines.push(l.text());
+                }
+            })
+            .unwrap();
+        let (text, at) = first_partial.expect("no partial line");
+        assert!(text.contains("working..."), "{text:?}");
+        assert!(at < Duration::from_millis(1500), "partial came only after {at:?}");
+        assert!(lines.iter().any(|l| l.contains("working...") && l.contains("done")), "{lines:?}");
     }
 
     #[test]
@@ -178,7 +256,7 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
         });
         let started = Instant::now();
-        let code = ShellProcess::spawn(line, &std::env::temp_dir()).unwrap().wait(&cancel, |_| {}).unwrap();
+        let code = ShellProcess::spawn(line, &std::env::temp_dir()).unwrap().wait(&cancel, |_, _| {}).unwrap();
         assert_ne!(code, Some(0));
         assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
     }

@@ -12,8 +12,10 @@ use crate::helpers::relative_to;
 /// Output lines kept for scrolling; a long build drops its oldest lines first.
 const MAX_LINES: usize = 20_000;
 
-/// The current (or last) pipeline run: per-step progress and captured output.
+/// One pipeline run, going on or finished: per-step progress and captured output.
 pub struct PipelineRun {
+    /// Tells this run's events apart from those of runs going on at the same time.
+    pub id: u64,
     pub name: String,
     pub steps: Vec<String>,
     pub states: Vec<StepState>,
@@ -21,6 +23,8 @@ pub struct PipelineRun {
     pub root: PathBuf,
     /// `(is a step header, text)`
     pub output: VecDeque<(bool, StyledLine)>,
+    /// The unfinished line a step is writing (a progress counter), shown below `output`.
+    pub partial: Option<StyledLine>,
     /// Lines received over the whole run, including dropped ones.
     pub total_lines: usize,
     pub finished: bool,
@@ -32,13 +36,15 @@ pub struct PipelineRun {
 }
 
 impl PipelineRun {
-    pub fn new(name: String, steps: Vec<String>, root: PathBuf) -> Self {
+    pub fn new(id: u64, name: String, steps: Vec<String>, root: PathBuf) -> Self {
         PipelineRun {
+            id,
             name,
             states: vec![StepState::Pending; steps.len()],
             steps,
             root,
             output: VecDeque::new(),
+            partial: None,
             total_lines: 0,
             finished: false,
             seen: false,
@@ -49,7 +55,7 @@ impl PipelineRun {
     }
 
     pub fn job(&self) -> Job {
-        Job::Pipeline { steps: self.steps.clone(), root: self.root.clone(), cancel: self.cancel.clone() }
+        Job::Pipeline { run: self.id, steps: self.steps.clone(), root: self.root.clone(), cancel: self.cancel.clone() }
     }
 
     pub fn cancel(&self) {
@@ -78,6 +84,7 @@ impl PipelineRun {
     }
 
     fn push(&mut self, header: bool, line: StyledLine) {
+        self.partial = None;
         if self.output.len() == MAX_LINES {
             self.output.pop_front();
         }
@@ -94,8 +101,12 @@ impl PipelineRun {
                 self.push(true, StyledLine::plain(format!("{at}$ {}", self.steps[step]), Style::default()));
             }
             PipelineEvent::Output(line) => self.push(false, line),
+            PipelineEvent::Partial(line) => self.partial = Some(line),
             PipelineEvent::StepFinished { step, state } => {
                 self.states[step] = state;
+                if let Some(line) = self.partial.take() {
+                    self.push(false, line);
+                }
                 match state {
                     StepState::Failed(Some(code)) => self.push(true, StyledLine::plain(format!("exit {code}"), Style::default())),
                     StepState::Cancelled => self.push(true, StyledLine::plain("cancelled", Style::default())),

@@ -15,5 +15,7 @@ pub enum Job {
     Detail { cwd: PathBuf, oid: String, remotes: Vec<String> },
     Run(Box<RunRequest>),
     /// Shell commands, on a thread of their own: a long build must not hold up git.
-    Pipeline { steps: Vec<String>, root: PathBuf, cancel: Arc<AtomicBool> },
+    Pipeline { run: u64, steps: Vec<String>, root: PathBuf, cancel: Arc<AtomicBool> },
+    /// `git diff from to`, written to `path`.
+    DiffFile { cwd: PathBuf, from: String, to: String, path: PathBuf },
 }

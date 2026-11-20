@@ -10,13 +10,13 @@ use super::{
     Commit, CommitDetail, ErrorReport, GitOutput, Job, JobResult, Journal, JournalEntry, PipelineEvent, PreflightInfo,
     RunOutcome, RunRequest, ShellProcess, Snapshot, Step, StepState, StyledLine,
 };
-use crate::helpers::{cd_target, force_console_color, is_mutating, lexical_join, local_hms, lossy, next_dir, norm_path, now_ms, to_string_args};
+use crate::helpers::{cd_target, force_console_color, is_mutating, lexical_join, local_hms, lossy, next_dir, norm_path, now_ms, remove_leftover_dir, to_string_args};
 
 /// Runs the steps in order, stopping at the first that doesn't succeed. A step that is
 /// just `cd` moves the following steps; grove handles it, since a shell would forget.
-fn run_pipeline(steps: &[String], root: &Path, cancel: &AtomicBool, tx: &Sender<JobResult>) {
+fn run_pipeline(run: u64, steps: &[String], root: &Path, cancel: &AtomicBool, tx: &Sender<JobResult>) {
     let emit = |event| {
-        let _ = tx.send(JobResult::Pipeline(event));
+        let _ = tx.send(JobResult::Pipeline { run, event });
     };
     let root = lexical_join(root, Path::new(""));
     let mut dir = root.clone();
@@ -35,7 +35,7 @@ fn run_pipeline(steps: &[String], root: &Path, cancel: &AtomicBool, tx: &Sender<
                 StepState::Failed(None)
             }
         } else {
-            match ShellProcess::spawn(&force_console_color(line), &dir).and_then(|p| p.wait(cancel, |l| emit(PipelineEvent::Output(l)))) {
+            match ShellProcess::spawn(&force_console_color(line), &dir).and_then(|p| p.wait(cancel, |l, partial| emit(if partial { PipelineEvent::Partial(l) } else { PipelineEvent::Output(l) }))) {
                 Ok(Some(0)) => StepState::Done,
                 Ok(_) if cancel.load(Ordering::Relaxed) => StepState::Cancelled,
                 Ok(code) => StepState::Failed(code),
@@ -97,8 +97,8 @@ impl Worker {
             return;
         }
         let tx = self.res_tx.clone();
-        if let Job::Pipeline { steps, root, cancel } = job {
-            thread::spawn(move || run_pipeline(&steps, &root, &cancel, &tx));
+        if let Job::Pipeline { run, steps, root, cancel } = job {
+            thread::spawn(move || run_pipeline(run, &steps, &root, &cancel, &tx));
             return;
         }
         thread::spawn(move || {
@@ -143,6 +143,15 @@ impl Worker {
                 let mut patch = get(&["show", "--format=", "--patch", "--diff-merges=first-parent", &oid]);
                 patch.truncate(512 * 1024);
                 JobResult::Detail(Box::new(CommitDetail::parse(&header, &numstat, &names, &contains, &patch, &remotes)))
+            }
+            Job::DiffFile { cwd, from, to, path } => {
+                let result = GitOutput::read(&cwd, &["diff", "--no-color", "--no-ext-diff", &from, &to])
+                    .map_err(|e| format!("{e:#}"))
+                    .and_then(|bytes| {
+                        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+                        Ok(bytes.iter().filter(|b| **b == b'\n').count())
+                    });
+                JobResult::DiffFile { path, result }
             }
             Job::Run(_) | Job::Pipeline { .. } => unreachable!("these run on threads of their own"),
         }
@@ -219,6 +228,11 @@ impl Worker {
                         if let Err(e) = std::fs::copy(from.join(f), &dest) {
                             outcome.warnings.push(format!("couldn't copy {}: {e}", f.display()));
                         }
+                    }
+                }
+                Step::RemoveDir { path, stop_at } => {
+                    if let Err(e) = remove_leftover_dir(path, stop_at) {
+                        outcome.warnings.push(format!("couldn't delete {}: {e}", path.display()));
                     }
                 }
             }

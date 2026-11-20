@@ -17,8 +17,8 @@ pub struct Ctx<'a> {
     pub copy_files: &'a [PathBuf],
     /// This repository's saved pipelines.
     pub pipelines: &'a [Pipeline],
-    /// The running or most recently finished pipeline.
-    pub pipeline_run: Option<&'a PipelineRun>,
+    /// Pipeline runs going on and recently finished, oldest first.
+    pub pipeline_runs: &'a [PipelineRun],
 }
 
 impl<'a> Ctx<'a> {

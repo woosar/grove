@@ -11,5 +11,7 @@ pub enum JobResult {
     LogPage { generation: u64, skip: usize, commits: Vec<Commit>, total: Option<usize> },
     Detail(Box<CommitDetail>),
     Ran(Box<RunOutcome>),
-    Pipeline(PipelineEvent),
+    Pipeline { run: u64, event: PipelineEvent },
+    /// Lines written, or why it failed.
+    DiffFile { path: PathBuf, result: Result<usize, String> },
 }

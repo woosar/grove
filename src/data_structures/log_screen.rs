@@ -8,8 +8,11 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::{Action, ActionPopup, Commit, CommitDetail, Ctx, Effect, GraphRow, Job, KeyBinding, LaneAllocator, LogFilter, Modal, Plan, PromptKind, PromptModal, Snapshot};
-use crate::helpers::{keep_visible, local_date_long, nav, pad, pad_left, relative_age_long, short_oid, str_width, wrap_text};
+use super::{
+    Action, ActionPopup, Commit, CommitDetail, Ctx, Effect, GraphRow, InternalOp, Job, KeyBinding, LaneAllocator, LogFilter, Modal, Plan,
+    PromptKind, PromptModal, Snapshot,
+};
+use crate::helpers::{diff_file_name, keep_visible, local_date_long, nav, pad, pad_left, relative_age_long, short_oid, str_width, wrap_text};
 
 /// The selection has to rest this long before its detail is loaded; holding j would
 /// otherwise start five git processes per commit passed.
@@ -44,6 +47,8 @@ pub struct LogScreen {
     last_sel: usize,
     anchor: Option<Rect>,
     page: usize,
+    /// Commits marked with `v` (at most two) for writing the diff between them.
+    marks: Vec<String>,
 }
 
 impl Default for LogScreen {
@@ -71,6 +76,7 @@ impl Default for LogScreen {
             last_sel: 0,
             anchor: None,
             page: 20,
+            marks: Vec::new(),
         }
     }
 }
@@ -197,9 +203,40 @@ impl LogScreen {
         )
     }
 
+    /// Marks or unmarks the selected commit; a third mark replaces the oldest.
+    fn toggle_mark(&mut self) {
+        let Some(oid) = self.selected().map(|c| c.oid.clone()) else { return };
+        if let Some(i) = self.marks.iter().position(|m| *m == oid) {
+            self.marks.remove(i);
+            return;
+        }
+        if self.marks.len() == 2 {
+            self.marks.remove(0);
+        }
+        self.marks.push(oid);
+    }
+
+    /// `git diff <older> <newer>` of the two marked commits, written to a file. The one
+    /// further down the log counts as older.
+    fn diff_file_action(&self) -> Option<Action> {
+        let [a, b] = self.marks.as_slice() else { return None };
+        let pos = |oid: &String| self.commits.iter().position(|c| c.oid == *oid).unwrap_or(usize::MAX);
+        let (from, to) = if pos(a) >= pos(b) { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+        let explain = format!(
+            "writes the full diff from {} to {} to {} in the worktree root",
+            short_oid(&from),
+            short_oid(&to),
+            diff_file_name(&from, &to)
+        );
+        Some(Action::new(KeyBinding::ch('D'), "diff file", Plan::internal(InternalOp::WriteDiff { from, to })).explain(explain))
+    }
+
     pub fn preview(&self, ctx: &Ctx) -> Option<Action> {
         if self.files_focused {
             return self.file_diff();
+        }
+        if let Some(a) = self.diff_file_action() {
+            return Some(a);
         }
         ctx.actions().commit_actions(self.selected()?).into_iter().find(|a| !a.verdict.is_blocked())
     }
@@ -213,6 +250,8 @@ impl LogScreen {
             ("R", "revert"),
             ("x", "reset to here"),
             ("t", "tag"),
+            ("v", "mark"),
+            ("D", "diff marked → file"),
             ("/", "filter"),
             ("b", "branches"),
             ("tab", "files"),
@@ -256,6 +295,20 @@ impl LogScreen {
                 self.all_branches = !self.all_branches;
                 self.invalidate();
                 return Some(Effect::Nothing);
+            }
+            KeyCode::Char('v') => {
+                self.toggle_mark();
+                return Some(Effect::Nothing);
+            }
+            KeyCode::Esc if !self.marks.is_empty() => {
+                self.marks.clear();
+                return Some(Effect::Nothing);
+            }
+            KeyCode::Char('D') => {
+                return Some(match self.diff_file_action() {
+                    Some(a) => Effect::run(a, "D"),
+                    None => Effect::Message("mark two commits with v first".into()),
+                });
             }
             _ => {}
         }
@@ -312,7 +365,12 @@ impl LogScreen {
             Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
         let filter_text = if self.filter.is_empty() { "path:any  author:any  since:any".to_string() } else { self.filter.to_input() };
-        let right = format!("b branches: {} {}", if self.all_branches { "all" } else { "current" }, g.tri_down);
+        let marked = match self.marks.len() {
+            0 => String::new(),
+            1 => format!("v 1 marked {} ", g.sep),
+            _ => format!("D diff file {} ", g.sep),
+        };
+        let right = format!("{marked}b branches: {} {}", if self.all_branches { "all" } else { "current" }, g.tri_down);
         let room = w.saturating_sub(str_width(&right) + 3);
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -326,7 +384,10 @@ impl LogScreen {
         let h = rows_area.height as usize;
         self.page = h.max(1);
         keep_visible(&mut self.offset, self.sel, h);
-        let graph_w = self.graph.iter().skip(self.offset).take(h).map(|r| r.width()).max().unwrap_or(1).min(w / 3).max(1);
+        // with marks, every row gets a column for them
+        let mark_w = if self.marks.is_empty() { 0 } else { 2 };
+        let row_w = w.saturating_sub(mark_w);
+        let graph_w = self.graph.iter().skip(self.offset).take(h).map(|r| r.width()).max().unwrap_or(1).min(row_w / 3).max(1);
         let rows: Vec<Line> = self
             .commits
             .iter()
@@ -334,7 +395,16 @@ impl LogScreen {
             .enumerate()
             .skip(self.offset)
             .take(h)
-            .map(|(i, (c, row))| t.commit_line(row, c, graph_w, w, i == self.sel, w >= 70))
+            .map(|(i, (c, row))| {
+                let line = t.commit_line(row, c, graph_w, row_w, i == self.sel, w >= 70);
+                if mark_w == 0 {
+                    return line;
+                }
+                let mark = if self.marks.contains(&c.oid) { g.diamond } else { " " };
+                let mut spans = vec![Span::styled(format!("{mark} "), t.s(t.tag))];
+                spans.extend(line.spans);
+                Line::from(spans).style(line.style)
+            })
             .collect();
         if rows.is_empty() && self.exhausted {
             f.render_widget(Paragraph::new(Span::styled("no commits match", t.dimmed())), rows_area);

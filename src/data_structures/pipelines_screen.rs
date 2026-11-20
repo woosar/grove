@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::{Action, Ctx, Effect, InternalOp, Pipeline, PipelineRun, PromptKind, StepState};
-use crate::helpers::{cd_target, home_tilde, keep_visible, nav, next_dir, pad, relative_to, step, str_width, truncate, wrap_text};
+use crate::helpers::{cd_target, home_tilde, keep_visible, nav, next_dir, pad, relative_to, same_path, step, str_width, truncate, wrap_text};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Focus {
@@ -30,6 +30,8 @@ pub struct PipelinesScreen {
     scroll_back: usize,
     /// `total_lines` at the last draw, to hold the view still while scrolled up.
     drawn_lines: usize,
+    /// Id of the run shown in Output; the newest run when unset or gone.
+    view: Option<u64>,
 }
 
 impl PipelinesScreen {
@@ -42,21 +44,45 @@ impl PipelinesScreen {
         self.step_sel = index;
     }
 
-    pub fn on_run_started(&mut self) {
-        self.scroll_back = 0;
-        self.drawn_lines = 0;
+    pub fn on_run_started(&mut self, id: u64) {
+        self.set_view(Some(id));
+    }
+
+    fn set_view(&mut self, id: Option<u64>) {
+        if id != self.view {
+            self.view = id;
+            self.scroll_back = 0;
+            self.drawn_lines = 0;
+        }
+    }
+
+    /// The run shown in the Output pane.
+    pub fn viewed<'a>(&self, ctx: &Ctx<'a>) -> Option<&'a PipelineRun> {
+        let runs = ctx.pipeline_runs;
+        self.view.and_then(|id| runs.iter().find(|r| r.id == id)).or(runs.last())
     }
 
     fn selected<'a>(&self, ctx: &Ctx<'a>) -> Option<&'a Pipeline> {
         ctx.pipelines.get(self.sel.min(ctx.pipelines.len().saturating_sub(1)))
     }
 
-    fn running(ctx: &Ctx) -> bool {
-        ctx.pipeline_run.is_some_and(PipelineRun::is_running)
+    /// The newest run of `p` in the active worktree.
+    fn latest_here<'a>(p: &Pipeline, ctx: &Ctx<'a>) -> Option<&'a PipelineRun> {
+        ctx.pipeline_runs.iter().rev().find(|r| r.name == p.name && same_path(&r.root, &ctx.snap.workdir))
     }
 
     pub fn preview(&self, ctx: &Ctx) -> Option<Action> {
-        Some(ctx.actions().run_pipeline(self.selected(ctx)?, Self::running(ctx)))
+        let p = self.selected(ctx)?;
+        Some(ctx.actions().run_pipeline(p, Self::latest_here(p, ctx).is_some_and(PipelineRun::is_running)))
+    }
+
+    /// Shows the run `delta` places further along the list of runs.
+    fn cycle_view(&mut self, ctx: &Ctx, delta: isize) {
+        let runs = ctx.pipeline_runs;
+        let Some(current) = self.viewed(ctx) else { return };
+        let at = runs.iter().position(|r| r.id == current.id).unwrap_or(0) as isize;
+        let next = (at + delta).rem_euclid(runs.len() as isize) as usize;
+        self.set_view(Some(runs[next].id));
     }
 
     pub fn hints(&self) -> Vec<(&'static str, &'static str)> {
@@ -82,7 +108,15 @@ impl PipelinesScreen {
                 ("tab", "pane"),
                 ("esc", "back"),
             ],
-            Focus::Output => vec![("j/k", "scroll"), ("g/G", "top / follow"), ("r", "run"), ("x", "cancel run"), ("tab", "pane"), ("esc", "back")],
+            Focus::Output => vec![
+                ("j/k", "scroll"),
+                ("g/G", "top / follow"),
+                (", / .", "other runs"),
+                ("r", "run"),
+                ("x", "cancel run"),
+                ("tab", "pane"),
+                ("esc", "back"),
+            ],
         }
     }
 
@@ -117,14 +151,19 @@ impl PipelinesScreen {
                 return Some(Effect::Nothing);
             }
             KeyCode::Char('n') => return Some(Effect::Internal(InternalOp::Prompt(PromptKind::NewPipeline))),
-            KeyCode::Char('x') => return Some(Effect::Internal(InternalOp::CancelPipeline)),
+            KeyCode::Char('x') => {
+                return Some(match self.viewed(ctx).filter(|r| r.is_running()) {
+                    Some(run) => Effect::Internal(InternalOp::CancelPipeline(run.id)),
+                    None => Effect::Message("nothing is running".into()),
+                });
+            }
             KeyCode::Char('r') => return self.preview(ctx).map(|a| Effect::run(a, "r")),
             _ => {}
         }
         match self.focus {
             Focus::List => self.list_key(key, ctx),
             Focus::Steps => self.steps_key(key, ctx),
-            Focus::Output => self.output_key(key),
+            Focus::Output => self.output_key(key, ctx),
         }
     }
 
@@ -132,6 +171,10 @@ impl PipelinesScreen {
         if let Some(s) = nav(key, self.sel, ctx.pipelines.len()) {
             if s != self.sel {
                 self.step_sel = 0;
+                // follow the selection to its run, if it has one here
+                if let Some(run) = ctx.pipelines.get(s).and_then(|p| Self::latest_here(p, ctx)) {
+                    self.set_view(Some(run.id));
+                }
             }
             self.sel = s;
             return Some(Effect::Nothing);
@@ -178,7 +221,11 @@ impl PipelinesScreen {
         }
     }
 
-    fn output_key(&mut self, key: &KeyEvent) -> Option<Effect> {
+    fn output_key(&mut self, key: &KeyEvent, ctx: &Ctx) -> Option<Effect> {
+        if let KeyCode::Char(c @ (',' | '.')) = key.code {
+            self.cycle_view(ctx, if c == '.' { 1 } else { -1 });
+            return Some(Effect::Nothing);
+        }
         self.scroll_back = match key.code {
             KeyCode::Char('k') | KeyCode::Up => self.scroll_back + 1,
             KeyCode::Char('j') | KeyCode::Down => self.scroll_back.saturating_sub(1),
@@ -230,10 +277,17 @@ impl PipelinesScreen {
         for (i, p) in ctx.pipelines.iter().enumerate().skip(self.offset).take(h) {
             let selected = i == self.sel;
             let count = format!("{} step{}", p.steps.len(), if p.steps.len() == 1 { "" } else { "s" });
-            let name_w = w.saturating_sub(count.len() + 3);
+            let name_w = w.saturating_sub(count.len() + 5);
+            let (state, color) = match Self::latest_here(p, ctx) {
+                Some(r) if r.is_running() => (g.spinner[0], t.accent),
+                Some(r) if r.failed() || r.cancelled() => (g.cross, t.err),
+                Some(_) => (g.check, t.ok),
+                None => (" ", t.dim),
+            };
             lines.push(t.row(
                 vec![
                     Span::styled(format!("{} ", if selected { g.pointer } else { " " }), t.s(t.accent)),
+                    Span::styled(format!("{state} "), t.s(color)),
                     Span::styled(pad(&p.name, name_w), t.text()),
                     Span::styled(format!(" {count}"), t.dimmed()),
                 ],
@@ -244,9 +298,9 @@ impl PipelinesScreen {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
-    /// The states to show next to `p`'s steps, if the current run is of this pipeline.
+    /// The states to show next to `p`'s steps: its newest run here, while the steps match.
     fn run_states<'a>(p: &Pipeline, ctx: &Ctx<'a>) -> Option<&'a [StepState]> {
-        ctx.pipeline_run.filter(|r| r.name == p.name && r.steps == p.steps).map(|r| r.states.as_slice())
+        Self::latest_here(p, ctx).filter(|r| r.steps == p.steps).map(|r| r.states.as_slice())
     }
 
     fn draw_steps(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
@@ -313,7 +367,7 @@ impl PipelinesScreen {
         let t = ctx.theme;
         let g = &t.g;
         let focused = self.focus == Focus::Output;
-        let Some(run) = ctx.pipeline_run else {
+        let Some(run) = self.viewed(ctx) else {
             let block = t.pane("Output", "", focused);
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -334,12 +388,19 @@ impl PipelinesScreen {
         } else {
             (format!("{} done", g.check), t.ok)
         };
-        let title = Line::from(vec![
+        let mut title = vec![
             Span::styled(format!("Output {} {} {} ", g.sep, run.name, g.sep), t.text()),
             Span::styled(status, t.s(color)),
             Span::styled(format!(" {} {}s", g.sep, run.elapsed().as_secs()), t.dimmed()),
-        ]);
-        let hint = if crate::helpers::same_path(&run.root, &ctx.snap.workdir) { String::new() } else { format!("in {}", relative_to(&run.root, &ctx.snap.workdir)) };
+        ];
+        let runs = ctx.pipeline_runs;
+        if runs.len() > 1 {
+            let at = runs.iter().position(|r| r.id == run.id).unwrap_or(0) + 1;
+            let running = runs.iter().filter(|r| r.is_running()).count();
+            title.push(Span::styled(format!(" {} run {at}/{} ({running} running)", g.sep, runs.len()), t.dimmed()));
+        }
+        let title = Line::from(title);
+        let hint = if same_path(&run.root, &ctx.snap.workdir) { String::new() } else { format!("in {}", relative_to(&run.root, &ctx.snap.workdir)) };
         let block = t.pane(title, &hint, focused);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -356,6 +417,12 @@ impl PipelinesScreen {
         // only wrap what can be seen: walk backwards until the view is covered
         let wanted = h.saturating_add(self.scroll_back);
         let mut rows: Vec<Line> = Vec::new();
+        // the line being written shows only while following, so it can't shift a scrolled view
+        if self.scroll_back == 0
+            && let Some(partial) = &run.partial
+        {
+            rows.extend(partial.wrap(w, t.text()).into_iter().rev());
+        }
         for (header, line) in run.output.iter().rev() {
             let base = if *header { t.s(t.accent) } else { t.text() };
             rows.extend(line.wrap(w, base).into_iter().rev());

@@ -503,6 +503,32 @@ pub fn short_oid(oid: &str) -> &str {
     &oid[..oid.len().min(7)]
 }
 
+/// The file the two-commit diff of the Log screen is written to.
+pub fn diff_file_name(from: &str, to: &str) -> String {
+    format!("grove-diff-{}-{}.diff", short_oid(from), short_oid(to))
+}
+
+/// Deletes `path` if it still exists, then each parent that is empty now, up to (not
+/// including) `stop_at`. Refuses anything that isn't strictly below `stop_at`.
+pub fn remove_leftover_dir(path: &Path, stop_at: &Path) -> std::io::Result<()> {
+    let below = |p: &Path| p.starts_with(stop_at) && !same_path(p, stop_at);
+    if !below(path) {
+        return Ok(());
+    }
+    if path.exists() {
+        std::fs::remove_dir_all(path)?;
+    }
+    let mut dir = path.parent();
+    while let Some(d) = dir.filter(|d| below(d)) {
+        let empty = std::fs::read_dir(d).map(|mut it| it.next().is_none()).unwrap_or(false);
+        if !empty || std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
 /// Word-wraps to `width` cells; overlong words are hard-split. Keeps empty lines.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(8);

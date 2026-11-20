@@ -10,6 +10,9 @@ pub enum Step {
     Git(Vec<OsString>),
     /// Copy untracked files from one checkout into another (new-worktree form).
     Copy { from: PathBuf, to: PathBuf, files: Vec<PathBuf> },
+    /// Delete a removed worktree's directory if git left it behind, then the parent
+    /// directories that are empty now, stopping below `stop_at`.
+    RemoveDir { path: PathBuf, stop_at: PathBuf },
 }
 
 impl Step {
@@ -20,6 +23,7 @@ impl Step {
                 let names: Vec<String> = files.iter().map(|f| f.to_string_lossy().replace('\\', "/")).collect();
                 format!("cp {} → {}/", names.join(" "), relative_to(to, cwd))
             }
+            Step::RemoveDir { path, .. } => format!("clean up {}", relative_to(path, cwd)),
         }
     }
 }

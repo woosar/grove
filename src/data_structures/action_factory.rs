@@ -23,10 +23,14 @@ const HELP_TRACK: &str = "git switch --track <remote>/<branch>\n\nCreates a loca
 const HELP_OPEN_WT: &str = "Open worktree (grove only)\n\nMakes that worktree grove's active context in a new grove tab. No git command runs. ctrl-tab cycles open tabs.";
 const HELP_PRUNE: &str = "git worktree prune --verbose\n\nRemoves git's administrative records for worktrees whose directories no longer exist (e.g. deleted with a file manager instead of `git worktree remove`). While such a record exists its branch counts as checked out and can't be checked out anywhere else.\n\nOnly the records go; branches and commits stay.";
 const HELP_LOCK: &str = "git worktree lock --reason <why> <path> / git worktree unlock <path>\n\nA locked worktree is protected from `git worktree prune` and `remove` — useful for checkouts on removable drives or long CI runs.";
-const HELP_REMOVE_WT: &str = "git worktree remove <path>\n\nDeletes the worktree's directory and git's record of it. Refuses if the worktree has modified or untracked files, or is locked. The branch it had checked out stays.";
+const HELP_REMOVE_WT: &str = "git worktree remove <path>\n\nDeletes the worktree's directory and git's record of it. Refuses if the worktree has modified or untracked files, or is locked. The branch it had checked out stays.
+
+Afterwards grove deletes whatever git left of the directory (e.g. files held open on Windows) and parent directories that are empty now, such as <repo>.wt/.";
 const HELP_FORCE_REMOVE_WT: &str = "git worktree remove --force <path>
 
-Deletes the worktree's directory even though it has modified or untracked files; those files exist nowhere else and are gone for good. A locked worktree needs --force twice. The branch it had checked out stays.";
+Deletes the worktree's directory even though it has modified or untracked files; those files exist nowhere else and are gone for good. A locked worktree needs --force twice. The branch it had checked out stays.
+
+Afterwards grove deletes whatever git left of the directory and parent directories that are empty now, such as <repo>.wt/.";
 const HELP_MOVE_WT: &str = "git worktree move <path> <new-path>\n\nMoves a worktree's directory and updates git's records. The main worktree and locked worktrees can't be moved.";
 const HELP_STAGE: &str = "git add -- <path> / git restore --staged -- <path>\n\nStaging puts the file's current content into the index, so the next commit includes it. Unstaging takes it back out of the index; your edits in the file are untouched.";
 const HELP_COMMIT: &str = "git commit -m <message>\n\nRecords everything staged as a new commit on the current branch.\n\nUndo: `git reset --soft HEAD~1` keeps the changes staged; grove's u uses `git reset --keep <HEAD before>`.";
@@ -36,6 +40,16 @@ const HELP_CHECKOUT: &str = "git switch --detach <commit>\n\nChecks out a commit
 const HELP_CHERRY: &str = "git cherry-pick <commit>\n\nCopies the changes of one commit onto the current branch as a new commit. The original stays where it is.\n\nStops on conflicts; abort returns to where you were.";
 const HELP_REVERT: &str = "git revert --no-edit <commit>\n\nCreates a new commit that undoes the changes of <commit>. History isn't rewritten, so it's safe on shared branches.";
 const HELP_RESET: &str = "git reset <mode> <commit>\n\nMoves the current branch to <commit>.\n  --soft   keeps all changes since then staged\n  --mixed  keeps them as unstaged edits\n  --keep   keeps your uncommitted edits, refuses if they'd be overwritten\n  --hard   throws away all uncommitted work — not recoverable\n\nCommits after <commit> stay reachable via the reflog for a while; grove's u can move back.";
+const HELP_RESET_HARD_HEAD: &str = "git reset --hard HEAD
+
+Puts the index and every tracked file back to the last commit: staged and unstaged edits, and unresolved merges, are thrown away. Untracked and ignored files are left alone (C removes untracked ones).
+
+These edits were never committed, so git can't bring them back.";
+const HELP_CLEAN: &str = "git clean -fd
+
+Deletes every untracked file and directory in the worktree. Ignored files (build output, node_modules…) stay; tracked files aren't touched (H resets those).
+
+Untracked files exist nowhere else, so they're gone for good.";
 const HELP_TAG: &str = "git tag <name> <commit>\n\nCreates a lightweight tag: a fixed name for a commit, e.g. a release. Tags aren't pushed unless you push them explicitly.";
 const HELP_COPY: &str = "Copy (grove only)\n\nCopies to the clipboard via the terminal (OSC 52). No git command runs.";
 const HELP_FETCH: &str = "git fetch --prune <remote>\n\nDownloads new commits and branches from the remote and updates the remote-tracking branches (origin/…). Never touches your branches or files. --prune drops remote-tracking branches deleted on the remote.";
@@ -44,7 +58,7 @@ const HELP_PUSH: &str = "git push\n\nUploads your branch's new commits to its up
 const HELP_PREVIOUS: &str = "git switch -\n\nSwitches back to the branch you were on before.";
 const HELP_PRUNE_MERGED: &str = "git branch -d <branches…>\n\nDeletes local branches whose commits are all in the main branch. -d still refuses anything unmerged, so nothing is lost. Branches checked out in a worktree are skipped.";
 const HELP_NEW_BRANCH: &str = "git switch -c <name>\n\nCreates a branch at the current commit and switches to it. Uncommitted changes come along.";
-const HELP_PIPELINE: &str = "Run pipeline (grove only)\n\nRuns the saved command lines in order, in a shell (cmd on Windows, sh elsewhere), and stops at the first one that fails. It starts in the root of the active worktree, so relative paths work in every worktree of this repository.\n\nA step that is just `cd <dir>` carries over to the following steps, relative to where the previous step ran; a bare `cd` goes back to the worktree root. `cd x && build` affects only that one line.\n\nCommands can't read input: stdin is closed. Git and the rest of grove stay usable during a run; x cancels it, including whatever it started. Runs aren't journaled and u can't undo them.
+const HELP_PIPELINE: &str = "Run pipeline (grove only)\n\nRuns the saved command lines in order, in a shell (cmd on Windows, sh elsewhere), and stops at the first one that fails. It starts in the root of the active worktree, so relative paths work in every worktree of this repository.\n\nA step that is just `cd <dir>` carries over to the following steps, relative to where the previous step ran; a bare `cd` goes back to the worktree root. `cd x && build` affects only that one line.\n\nCommands can't read input: stdin is closed. Several pipelines can run at once, each once per worktree. Git and the rest of grove stay usable during a run; x cancels the run shown, including whatever it started. Runs aren't journaled and u can't undo them.
 
 Colors: tools are asked for colored output (FORCE_COLOR, CLICOLOR_FORCE, CARGO_TERM_COLOR), and a plain `dotnet build`/`test`/`publish`… line gets -clp:ForceConsoleColor, since MSBuild otherwise colors only a real console.";
 
@@ -371,7 +385,11 @@ impl<'a> ActionFactory<'a> {
             lock.verdict = Verdict::blocked("the main worktree can't be locked");
         }
 
-        let mut remove = Action::new(KeyBinding::ch('x'), "remove", Plan::git(&["worktree", "remove", &rel]))
+        let cleanup = Step::RemoveDir {
+            path: wt.path.clone(),
+            stop_at: self.snap.main_worktree.parent().map(Path::to_path_buf).unwrap_or_default(),
+        };
+        let mut remove = Action::new(KeyBinding::ch('x'), "remove", Plan::git(&["worktree", "remove", &rel]).and_step(cleanup.clone()))
             .explain("deletes the worktree directory; its branch stays")
             .note("refuses if dirty")
             .help(HELP_REMOVE_WT);
@@ -401,7 +419,7 @@ impl<'a> ActionFactory<'a> {
         if let Some(reason) = &wt.locked {
             lost.push(if reason.is_empty() { "It is locked.".to_string() } else { format!("It is locked: \"{reason}\".") });
         }
-        let mut force = Action::new(KeyBinding::ch('X'), "force rm", Plan::git(&force_args))
+        let mut force = Action::new(KeyBinding::ch('X'), "force rm", Plan::git(&force_args).and_step(cleanup))
             .explain("deletes the worktree directory even with uncommitted work or a lock; its branch stays")
             .note("deletes uncommitted work")
             .help(HELP_FORCE_REMOVE_WT)
@@ -472,6 +490,43 @@ impl<'a> ActionFactory<'a> {
             .help(HELP_STAGE)
     }
 
+    /// Global `H`: back to HEAD, dropping staged and unstaged edits.
+    pub fn reset_hard_head(&self) -> Action {
+        let st = &self.snap.status;
+        let n = st.count(ChangeArea::Staged) + st.count(ChangeArea::Unstaged) + st.count(ChangeArea::Conflicted);
+        let wt = self.snap.short_path(&self.snap.workdir);
+        let mut action = Action::new(KeyBinding::ch('H'), "reset hard", Plan::git(&["reset", "--hard", "HEAD"]))
+            .explain("throws away every staged and unstaged edit — not recoverable; untracked files stay")
+            .help(HELP_RESET_HARD_HEAD)
+            .destructive()
+            .confirm(format!(
+                "Throw away {n} changed file{} in {wt}? Not recoverable; untracked files stay.",
+                if n == 1 { "" } else { "s" }
+            ));
+        if n == 0 {
+            action.verdict = Verdict::blocked("nothing to reset — no staged or unstaged changes");
+        }
+        action
+    }
+
+    /// Global `C`: delete untracked files and directories.
+    pub fn clean_untracked(&self) -> Action {
+        let n = self.snap.status.count(ChangeArea::Untracked);
+        let wt = self.snap.short_path(&self.snap.workdir);
+        let mut action = Action::new(KeyBinding::ch('C'), "clean", Plan::git(&["clean", "-fd"]))
+            .explain("deletes untracked files and directories — not recoverable; ignored files stay")
+            .help(HELP_CLEAN)
+            .destructive()
+            .confirm(format!(
+                "Delete {n} untracked entr{} in {wt}? Not recoverable; ignored files stay.",
+                if n == 1 { "y" } else { "ies" }
+            ));
+        if n == 0 {
+            action.verdict = Verdict::blocked("nothing untracked to clean");
+        }
+        action
+    }
+
     // ---- commits --------------------------------------------------------------------
 
     pub fn commit_actions(&self, c: &Commit) -> Vec<Action> {
@@ -538,7 +593,7 @@ impl<'a> ActionFactory<'a> {
             .explain(p.display())
             .help(HELP_PIPELINE);
         if running {
-            action.verdict = Verdict::blocked("a pipeline is already running — x cancels it");
+            action.verdict = Verdict::blocked("already running in this worktree — x cancels it");
         } else if p.steps.is_empty() {
             action.verdict = Verdict::Blocked { reason: "no steps yet — press a to add one".into(), alternative: Some(KeyBinding::ch('a')) };
         }
