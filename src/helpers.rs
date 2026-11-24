@@ -55,6 +55,21 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     norm_path(a) == norm_path(b)
 }
 
+/// A path as typed by the user: quotes dropped, a leading `~` expanded, and relative
+/// paths taken from `cwd`.
+pub fn expand_user_path(input: &str, cwd: &Path) -> PathBuf {
+    let input = input.trim().trim_matches('"');
+    let home = || directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    let path = match input.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') => match home() {
+            Some(h) => h.join(rest.trim_start_matches(['/', '\\'])),
+            None => PathBuf::from(input),
+        },
+        _ => PathBuf::from(input),
+    };
+    if path.is_relative() { cwd.join(path) } else { path }
+}
+
 /// `target` expressed relative to `base` (`../grove.wt/x`), with forward slashes.
 /// Falls back to the absolute path when they share no root (different drives).
 pub fn relative_to(target: &Path, base: &Path) -> String {

@@ -50,6 +50,14 @@ const HELP_CLEAN: &str = "git clean -fd
 Deletes every untracked file and directory in the worktree. Ignored files (build output, node_modules…) stay; tracked files aren't touched (H resets those).
 
 Untracked files exist nowhere else, so they're gone for good.";
+const HELP_DISCARD_ALL: &str = "git reset --hard HEAD && git clean -fd
+
+Puts the worktree back exactly to its last commit: staged and unstaged edits are thrown away and untracked files and directories are deleted. Ignored files (build output, node_modules…) stay.
+
+None of it was ever committed, so git can't bring it back.";
+const HELP_STAGE_SELECTION: &str = "git add -- <paths> / git restore --staged -- <paths>
+
+Checked files go into the index, so the next commit includes them; unchecking a staged file takes it back out. Your edits in the files are never touched. With c, the commit dialog opens once the files are staged.";
 const HELP_TAG: &str = "git tag <name> <commit>\n\nCreates a lightweight tag: a fixed name for a commit, e.g. a release. Tags aren't pushed unless you push them explicitly.";
 const HELP_COPY: &str = "Copy (grove only)\n\nCopies to the clipboard via the terminal (OSC 52). No git command runs.";
 const HELP_FETCH: &str = "git fetch --prune <remote>\n\nDownloads new commits and branches from the remote and updates the remote-tracking branches (origin/…). Never touches your branches or files. --prune drops remote-tracking branches deleted on the remote.";
@@ -444,7 +452,65 @@ impl<'a> ActionFactory<'a> {
             mv.verdict = Verdict::blocked("locked — unlock first");
         }
 
-        if wt.prunable.is_some() { vec![prune, open, lock, remove, force, mv] } else { vec![open, prune, lock, remove, force, mv] }
+        let [reset, clean, discard] = self.worktree_cleanup_actions(wt);
+        if wt.prunable.is_some() {
+            vec![prune, open, reset, clean, discard, lock, remove, force, mv]
+        } else {
+            vec![open, reset, clean, discard, prune, lock, remove, force, mv]
+        }
+    }
+
+    /// `H` / `C` / `D` on the Worktrees screen: reset, clean, or both, in the selected
+    /// worktree (run there, whichever worktree grove is in).
+    fn worktree_cleanup_actions(&self, wt: &Worktree) -> [Action; 3] {
+        let rel = self.snap.short_path(&wt.path);
+        let dirty = wt.dirty.unwrap_or_default();
+        let tracked = dirty.modified + dirty.staged + dirty.conflicted;
+        let gone = if wt.prunable.is_some() {
+            Some("the directory is gone — prune it instead")
+        } else if wt.bare {
+            Some("a bare repository has no files to reset")
+        } else if wt.dirty.is_none() {
+            Some("couldn't read its status")
+        } else {
+            None
+        };
+        let blocked_unless = |ok: bool, why: &str| match gone {
+            Some(reason) => Verdict::blocked(reason),
+            None if !ok => Verdict::blocked(why),
+            None => Verdict::Ok,
+        };
+        let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+
+        let reset = Action::new(KeyBinding::ch('H'), "reset hard", Plan::git(&["reset", "--hard", "HEAD"]).in_dir(wt.path.clone()))
+            .explain(format!("throws away staged and unstaged edits in {rel} — not recoverable; untracked files stay"))
+            .note("drops edits")
+            .help(HELP_RESET_HARD_HEAD)
+            .destructive()
+            .confirm(format!("Throw away {} in {rel}? Not recoverable; untracked files stay.", plural(tracked, "change", "changes")))
+            .verdict(blocked_unless(tracked > 0, "nothing to reset — no staged or unstaged changes"));
+        let clean = Action::new(KeyBinding::ch('C'), "clean", Plan::git(&["clean", "-fd"]).in_dir(wt.path.clone()))
+            .explain(format!("deletes untracked files and directories in {rel} — not recoverable; ignored files stay"))
+            .note("deletes untracked")
+            .help(HELP_CLEAN)
+            .destructive()
+            .confirm(format!(
+                "Delete {} in {rel}? Not recoverable; ignored files stay.",
+                plural(dirty.untracked, "untracked entry", "untracked entries")
+            ))
+            .verdict(blocked_unless(dirty.untracked > 0, "nothing untracked to clean"));
+        let discard = Action::new(
+            KeyBinding::ch('D'),
+            "discard all",
+            Plan::git(&["reset", "--hard", "HEAD"]).and(&["clean", "-fd"]).in_dir(wt.path.clone()),
+        )
+        .explain(format!("puts {rel} back to its last commit: edits dropped, untracked files deleted — not recoverable"))
+        .note("back to HEAD")
+        .help(HELP_DISCARD_ALL)
+        .destructive()
+        .confirm(format!("Discard all uncommitted work in {rel} ({})? Not recoverable; ignored files stay.", dirty.describe()))
+        .verdict(blocked_unless(!dirty.is_clean(), "nothing to discard — the worktree is clean"));
+        [reset, clean, discard]
     }
 
     // ---- status ---------------------------------------------------------------------
@@ -488,6 +554,43 @@ impl<'a> ActionFactory<'a> {
         Action::new(KeyBinding::ch('A'), "stage all", Plan::git(&["add", "-A"]))
             .explain("stages every change, including untracked files")
             .help(HELP_STAGE)
+    }
+
+    /// The stage dialog's `⏎` (and `c`, with `commit`): stage the checked paths, unstage
+    /// the unchecked ones, and optionally open the commit dialog. `staged_after` is how
+    /// many paths will have something staged once it ran.
+    pub fn stage_selection(&self, add: &[String], unstage: &[String], staged_after: usize, commit: bool) -> Action {
+        let mut plan = Plan::default();
+        if !add.is_empty() {
+            let mut args = vec!["add", "--"];
+            args.extend(add.iter().map(String::as_str));
+            plan = plan.and(&args);
+        }
+        if !unstage.is_empty() {
+            let mut args = vec!["restore", "--staged", "--"];
+            args.extend(unstage.iter().map(String::as_str));
+            plan = plan.and(&args);
+        }
+        let files = |n: usize| format!("{n} file{}", if n == 1 { "" } else { "s" });
+        let mut what = Vec::new();
+        if !add.is_empty() {
+            what.push(format!("stages {}", files(add.len())));
+        }
+        if !unstage.is_empty() {
+            what.push(format!("unstages {}", files(unstage.len())));
+        }
+        let (key, label) = if commit { (KeyBinding::ch('c'), "stage + commit") } else { (KeyBinding::enter(), "stage") };
+        let mut action = Action::new(key, label, plan).help(HELP_STAGE_SELECTION);
+        if commit {
+            action.plan = action.plan.then(InternalOp::CommitDialog { then_switch: None });
+            what.push(format!("then asks for the message to commit {}", files(staged_after)));
+            if staged_after == 0 {
+                action.verdict = Verdict::blocked("nothing checked — space checks a file, a checks all");
+            }
+        } else if what.is_empty() {
+            action.verdict = Verdict::blocked("nothing changed — space checks a file, a checks all");
+        }
+        action.explain(what.join(", "))
     }
 
     /// Global `H`: back to HEAD, dropping staged and unstaged edits.

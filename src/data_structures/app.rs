@@ -15,8 +15,8 @@ use ratatui::{DefaultTerminal, Frame};
 use super::{
     Action, ActionPopup, BranchesScreen, Cli, ConfirmModal, Ctx, DashboardScreen, Effect, ErrorDialog, GroveError, HelpModal,
     InternalOp, Job, JobResult, Journal, JournalEntry, JournalScreen, KeyBinding, LogScreen, Modal, Pager, Pipeline, PipelineEvent,
-    PipelineRun, PipelinesScreen, Plan, PreflightInfo, PromptKind, PromptModal, QuickSwitcher, RunOutcome, RunRequest, ScreenId,
-    Snapshot, Theme, Verdict, Worker, WorktreesScreen,
+    PipelineRun, PipelinesScreen, Plan, PreflightInfo, PromptKind, PromptModal, QuickSwitcher, RepoPicker, RunOutcome, RunRequest,
+    ScreenId, Snapshot, Theme, Verdict, Worker, WorktreesScreen,
 };
 use crate::helpers::{
     copy_to_clipboard, diff_file_name, home_tilde, norm_path, relative_to, same_path, short_oid, str_width, truecolor_supported, truncate,
@@ -91,32 +91,24 @@ pub struct App {
     /// Clock for the spinner, so it turns at the same pace however often frames come.
     started: Instant,
     quit: bool,
+    /// Quitting goes back to the repository picker instead of exiting.
+    pick_repo: bool,
 }
 
 impl App {
-    /// Opens the repository and the journal; fails with a plain-language message when
-    /// the path isn't inside a repository.
-    pub fn new(cli: Cli) -> Result<App> {
-        let cwd = match &cli.path {
-            Some(p) => p.clone(),
-            None => std::env::current_dir()?,
-        };
-        if let Err(out) = Snapshot::locate(&cwd) {
+    /// Opens the repository containing `cwd`; fails with a plain-language message when
+    /// it isn't inside one. The repository is remembered for the picker.
+    pub fn new(cli: &Cli, cwd: &Path, journal: Arc<Mutex<Journal>>) -> Result<App> {
+        if let Err(out) = Snapshot::locate(cwd) {
             let stderr = out.stderr_text();
             let err = GroveError::classify(&["rev-parse".to_string()], out.status, &stderr);
             let (pre, name, post) = err.headline();
             bail!("{pre}{name}{post}\n{}\n\n{}", err.explanation(), stderr.trim());
         }
-        let snap = Snapshot::load(&cwd)?;
-
-        let journal = match cli.journal.clone().or_else(Journal::default_path) {
-            Some(path) => Journal::open(&path).or_else(|e| {
-                eprintln!("grove: journal unavailable ({e:#}); history won't persist this session");
-                Journal::open_in_memory()
-            })?,
-            None => Journal::open_in_memory()?,
-        };
-        let journal = Arc::new(Mutex::new(journal));
+        let snap = Snapshot::load(cwd)?;
+        if let Ok(j) = journal.lock() {
+            let _ = j.touch_repo(&snap.main_worktree);
+        }
         let theme = Theme::new(truecolor_supported(), cli.ascii);
         let mut app = App {
             theme,
@@ -140,7 +132,7 @@ impl App {
             preflight_pending: HashSet::new(),
             tail: Vec::new(),
             last_used: HashMap::new(),
-            copy_files: cli.copy,
+            copy_files: cli.copy.clone(),
             running: None,
             queued: 0,
             message: None,
@@ -152,20 +144,54 @@ impl App {
             probe_pending: false,
             started: Instant::now(),
             quit: false,
+            pick_repo: false,
         };
         app.reload_journal_data();
         Ok(app)
     }
 
-    /// Opens the repository, sets up the terminal, runs until quit, and restores it.
+    /// Opens the repository given on the command line, or else lets the user pick a
+    /// saved one; runs until quit, going back to the picker on `O`, and restores the
+    /// terminal. Grove never changes the shell's directory: git runs in the picked one.
     pub fn launch(cli: Cli) -> Result<()> {
-        let mut app = App::new(cli)?;
+        let journal = Arc::new(Mutex::new(Journal::open_or_memory(cli.journal.clone())?));
+        let started_in = std::env::current_dir()?;
+        // an explicit path fails before the terminal is taken over, like any CLI error
+        let mut app = match &cli.path {
+            Some(p) => Some(App::new(&cli, p, journal.clone())?),
+            None => None,
+        };
+        let theme = Theme::new(truecolor_supported(), cli.ascii);
         let mut terminal = ratatui::try_init()?;
         let _ = execute!(std::io::stdout(), EnableFocusChange);
-        let result = app.run(&mut terminal);
+        let mut error = None;
+        let result = loop {
+            let mut current = match app.take() {
+                Some(a) => a,
+                None => {
+                    let picked = RepoPicker::new(&journal, &started_in, error.take()).run(&mut terminal, &theme, &journal);
+                    let path = match picked {
+                        Ok(Some(p)) => p,
+                        Ok(None) => break Ok(()),
+                        Err(e) => break Err(e),
+                    };
+                    match App::new(&cli, &path, journal.clone()) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            error = Some(format!("{e:#}").lines().next().unwrap_or_default().to_string());
+                            continue;
+                        }
+                    }
+                }
+            };
+            let ran = current.run(&mut terminal);
+            current.stop_pipelines();
+            if ran.is_err() || !current.pick_repo {
+                break ran;
+            }
+        };
         let _ = execute!(std::io::stdout(), DisableFocusChange);
         ratatui::restore();
-        app.stop_pipelines();
         result
     }
 
@@ -540,6 +566,14 @@ impl App {
             '[' => self.cycle_tab(-1),
             'H' => self.request_run(f.reset_hard_head(), "H".into(), None),
             'C' => self.request_run(f.clean_untracked(), "C".into(), None),
+            'O' if self.pipeline_running() => {
+                let color = self.theme.accent;
+                self.message("a pipeline is running — x on the Pipelines screen cancels it before switching repositories", color);
+            }
+            'O' => {
+                self.pick_repo = true;
+                self.quit = true;
+            }
             'q' if self.pipeline_running() => {
                 let color = self.theme.accent;
                 self.message("a pipeline is running — x on the Pipelines screen cancels it, ctrl-c quits and kills it", color);
@@ -572,6 +606,8 @@ impl App {
             ("u", "undo the last change (reflog)"),
             ("H", "git reset --hard HEAD (asks first)"),
             ("C", "git clean -fd (asks first)"),
+            ("", "  on Worktrees: in the selected worktree"),
+            ("O", "open another repository (picker)"),
             ("ctrl-tab or ] / [", "cycle worktree tabs"),
             ("esc", "close"),
             ("q", "quit"),
@@ -1054,8 +1090,9 @@ mod tests {
     }
 
     fn app_for(repo: &Path, root: &Path) -> App {
-        App::new(Cli { path: Some(repo.to_path_buf()), ascii: false, copy: vec![], journal: Some(root.join("journal.db")) })
-            .unwrap()
+        let cli = Cli { path: Some(repo.to_path_buf()), ascii: false, copy: vec![], journal: Some(root.join("journal.db")) };
+        let journal = Arc::new(Mutex::new(Journal::open(&root.join("journal.db")).unwrap()));
+        App::new(&cli, repo, journal).unwrap()
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -1588,6 +1625,86 @@ mod tests {
         press(&mut app, KeyCode::Char('H'));
         press(&mut app, KeyCode::Char('C'));
         assert!(app.modals.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_worktrees_screen_resets_and_cleans_the_selected_worktree() {
+        let (root, repo) = scenario("wt-clean");
+        let wt = root.join("repo.wt").join("log-graph");
+        std::fs::write(wt.join("lanes.rs"), "fn lanes() { edited }
+").unwrap();
+        std::fs::write(wt.join("scratch.txt"), "untracked").unwrap();
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('4'));
+        let at = app.snap.worktrees.iter().position(|w| w.path.ends_with("log-graph")).unwrap();
+        for _ in 0..at {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        press(&mut app, KeyCode::Char('D'));
+        let Some(Modal::Confirm(c)) = app.modals.last() else { panic!("no confirm:
+{}", render(&mut app)) };
+        assert_eq!(c.action.plan.display(&repo), "cd ../repo.wt/log-graph && git reset --hard HEAD && git clean -fd");
+        press(&mut app, KeyCode::Char('Y'));
+        settle(&mut app);
+        assert_eq!(std::fs::read_to_string(wt.join("lanes.rs")).unwrap(), "fn lanes() {}
+");
+        assert!(!wt.join("scratch.txt").exists());
+        // the active worktree wasn't touched, and grove stayed in it
+        assert!(std::fs::read_to_string(repo.join("Cargo.toml")).unwrap().contains("rusqlite"));
+        assert!(same_path(&app.snap.workdir, &repo));
+        // clean now: all three are blocked and never reach git
+        for k in ['H', 'C', 'D'] {
+            press(&mut app, KeyCode::Char(k));
+            assert!(app.modals.is_empty(), "{k} asked on a clean worktree");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_log_stage_dialog_stages_picked_files_and_commits() {
+        let (root, repo) = scenario("stage");
+        std::fs::write(repo.join("notes.txt"), "new").unwrap();
+        std::fs::write(repo.join("other.txt"), "also new").unwrap();
+        let mut app = app_for(&repo, &root);
+        settle(&mut app);
+        press(&mut app, KeyCode::Char('2'));
+        settle(&mut app);
+        // nothing staged: m refuses and points at a
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.modals.is_empty());
+        press(&mut app, KeyCode::Char('a'));
+        assert!(matches!(app.modals.last(), Some(Modal::Stage(_))), "{}", render(&mut app));
+        // rows sorted: Cargo.toml, notes.txt, other.txt — check the first two
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        let screen = render(&mut app);
+        assert!(screen.contains("git add -- Cargo.toml notes.txt"), "{screen}");
+        press(&mut app, KeyCode::Char('c'));
+        settle(&mut app);
+        let Some(Modal::Prompt(_)) = app.modals.last() else { panic!("no commit prompt:
+{}", render(&mut app)) };
+        typing(&mut app, "deps and notes");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        let entries = journal(&app, false);
+        assert_eq!(entries[0].argv, ["commit", "-m", "deps and notes"]);
+        assert_eq!(entries[1].argv, ["add", "--", "Cargo.toml", "notes.txt"]);
+        // other.txt stayed out of the commit
+        let left: Vec<String> = app.snap.status.changes.iter().map(|c| c.display()).collect();
+        assert_eq!(left, ["other.txt"]);
+
+        // a checks all, a again unchecks all
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.modals.last(), Some(Modal::Stage(_))), "nothing changed, so it stays open");
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(app.snap.status.changes.iter().all(|c| c.area == super::super::ChangeArea::Staged));
         let _ = std::fs::remove_dir_all(root);
     }
 

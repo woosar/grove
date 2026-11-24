@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
-use super::{Action, ActionPopup, ConfirmModal, Ctx, Effect, ErrorDialog, HelpModal, Pager, PromptModal, QuickSwitcher};
+use super::{Action, ActionPopup, ConfirmModal, Ctx, Effect, ErrorDialog, HelpModal, Pager, PromptModal, QuickSwitcher, StageModal};
 
 /// Anything drawn on top of a screen. The app keeps a stack; the top one gets keys.
 pub enum Modal {
@@ -13,6 +13,7 @@ pub enum Modal {
     Prompt(PromptModal),
     Confirm(ConfirmModal),
     Pager(Pager),
+    Stage(StageModal),
 }
 
 impl Modal {
@@ -25,6 +26,7 @@ impl Modal {
             Modal::Prompt(m) => m.handle_key(key, ctx),
             Modal::Confirm(m) => m.handle_key(key),
             Modal::Pager(m) => m.handle_key(key),
+            Modal::Stage(m) => m.handle_key(key, ctx),
         }
     }
 
@@ -38,6 +40,7 @@ impl Modal {
             Modal::Prompt(m) => m.draw(f, body, ctx),
             Modal::Confirm(m) => m.draw(f, body, ctx),
             Modal::Pager(m) => m.draw(f, body, ctx),
+            Modal::Stage(m) => m.draw(f, body, ctx),
         }
     }
 
@@ -49,6 +52,7 @@ impl Modal {
             Modal::Error(m) => m.preview(),
             Modal::Prompt(m) => m.preview(ctx),
             Modal::Confirm(m) => Some(m.action.clone()),
+            Modal::Stage(m) => m.preview(ctx),
             Modal::Help(_) | Modal::Pager(_) => None,
         }
     }
@@ -75,6 +79,7 @@ impl Modal {
             Modal::Confirm(m) if m.action.destructive => vec![("Y", "confirm"), ("esc", "cancel")],
             Modal::Confirm(_) => vec![("y", "confirm"), ("esc", "cancel")],
             Modal::Pager(_) => vec![("j/k", "scroll"), ("space", "page"), ("y", "copy"), ("q", "close")],
+            Modal::Stage(_) => vec![("j/k", "move"), ("space", "toggle"), ("a", "all"), ("⏎", "stage"), ("c", "stage + commit"), ("esc", "close")],
         }
     }
 }

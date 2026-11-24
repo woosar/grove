@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::{InternalOp, Step};
-use crate::helpers::to_os_args;
+use crate::helpers::{relative_to, same_path, to_os_args};
 
 /// What an action will run: git steps in order (stop on first failure), then an
 /// optional internal follow-up.
@@ -63,7 +63,8 @@ impl Plan {
     }
 
     /// The shell-ish rendering shown in the preview line, e.g.
-    /// `git stash push -m x && git switch main`. Internal plans read `grove: …`.
+    /// `git stash push -m x && git switch main`. Internal plans read `grove: …`; a plan
+    /// for another directory starts with `cd <dir> &&`.
     pub fn display(&self, cwd: &Path) -> String {
         if self.steps.is_empty() {
             return match &self.then {
@@ -71,6 +72,10 @@ impl Plan {
                 None => "grove: nothing to do".to_string(),
             };
         }
-        self.steps.iter().map(|s| s.display(cwd)).collect::<Vec<_>>().join(" && ")
+        let line = self.steps.iter().map(|s| s.display(cwd)).collect::<Vec<_>>().join(" && ");
+        match &self.cwd {
+            Some(dir) if !same_path(dir, cwd) => format!("cd {} && {line}", relative_to(dir, cwd)),
+            _ => line,
+        }
     }
 }

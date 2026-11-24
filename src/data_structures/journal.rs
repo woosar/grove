@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{JournalEntry, JournalFilter, Pipeline};
+use super::{JournalEntry, JournalFilter, Pipeline, SavedRepo};
+use crate::helpers::{norm_path, now_ms};
 
 /// Cap for stored stdout/stderr.
 const MAX_OUTPUT: usize = 64 * 1024;
@@ -36,6 +37,13 @@ CREATE INDEX entry_repo_time ON entry(repo_root, started_at DESC);",
   name      TEXT NOT NULL,
   steps     TEXT NOT NULL,
   UNIQUE (repo_root, name)
+);",
+    "CREATE TABLE repo (
+  id          INTEGER PRIMARY KEY,
+  key         TEXT NOT NULL UNIQUE,
+  path        TEXT NOT NULL,
+  added_at    INTEGER NOT NULL,
+  last_opened INTEGER
 );",
 ];
 
@@ -99,6 +107,18 @@ impl Journal {
         let journal = Journal { conn, path: Some(path.to_path_buf()) };
         journal.migrate()?;
         Ok(journal)
+    }
+
+    /// The journal at `path`, else at the default location; in memory (with a warning)
+    /// when neither can be opened.
+    pub fn open_or_memory(path: Option<PathBuf>) -> Result<Journal> {
+        match path.or_else(Journal::default_path) {
+            Some(path) => Journal::open(&path).or_else(|e| {
+                eprintln!("grove: journal unavailable ({e:#}); history won't persist this session");
+                Journal::open_in_memory()
+            }),
+            None => Journal::open_in_memory(),
+        }
     }
 
     pub fn open_in_memory() -> Result<Journal> {
@@ -237,6 +257,44 @@ impl Journal {
         run().unwrap_or_default()
     }
 
+    /// Saved base repositories, most recently opened first, never-opened ones last.
+    pub fn repos(&self) -> Vec<SavedRepo> {
+        let run = || -> rusqlite::Result<Vec<SavedRepo>> {
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT id, path, last_opened FROM repo ORDER BY coalesce(last_opened, 0) DESC, path COLLATE NOCASE")?;
+            let rows = stmt.query_map([], |r| Ok(SavedRepo { id: r.get(0)?, path: PathBuf::from(r.get::<_, String>(1)?), last_opened: r.get(2)? }))?;
+            rows.collect()
+        };
+        run().unwrap_or_default()
+    }
+
+    /// Saves a base repository; one already saved keeps its history.
+    pub fn add_repo(&self, path: &Path) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO repo (key, path, added_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO NOTHING",
+            params![norm_path(path), path.to_string_lossy(), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Saves a base repository if needed and marks it as opened just now.
+    pub fn touch_repo(&self, path: &Path) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO repo (key, path, added_at, last_opened) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(key) DO UPDATE SET last_opened = excluded.last_opened, path = excluded.path",
+            params![norm_path(path), path.to_string_lossy(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a saved repository; nothing on disk changes.
+    pub fn forget_repo(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM repo WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     /// Stores a new, empty pipeline and returns it.
     pub fn create_pipeline(&self, repo: &str, name: &str) -> Result<Pipeline> {
         self.conn.execute("INSERT INTO pipeline (repo_root, name, steps) VALUES (?1, ?2, '[]')", params![repo, name])?;
@@ -271,6 +329,21 @@ mod tests {
         j.delete_pipeline(p.id).unwrap();
         assert!(j.pipelines("/r/.git").is_empty());
         assert_eq!(j.pipelines("/other/.git").len(), 1);
+    }
+
+    #[test]
+    fn repos_are_unique_by_path_and_ordered_by_last_open() {
+        let j = Journal::open_in_memory().unwrap();
+        j.add_repo(Path::new("/src/alpha")).unwrap();
+        j.add_repo(Path::new("/src/beta")).unwrap();
+        j.add_repo(Path::new("/src/alpha/")).unwrap();
+        assert_eq!(j.repos().len(), 2, "a trailing slash is the same repo");
+        j.touch_repo(Path::new("/src/beta")).unwrap();
+        let repos = j.repos();
+        assert_eq!(repos[0].name(), "beta");
+        assert!(repos[0].last_opened.is_some() && repos[1].last_opened.is_none());
+        j.forget_repo(repos[0].id).unwrap();
+        assert_eq!(j.repos().len(), 1);
     }
 
     fn sample(argv: &[&str], exit: i32, via: &str, mutating: bool) -> JournalEntry {

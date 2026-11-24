@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 
 use super::{
     Action, ActionPopup, Commit, CommitDetail, Ctx, Effect, GraphRow, InternalOp, Job, KeyBinding, LaneAllocator, LogFilter, Modal, Plan,
-    PromptKind, PromptModal, Snapshot,
+    PromptKind, PromptModal, Snapshot, StageModal,
 };
 use crate::helpers::{diff_file_name, keep_visible, local_date_long, nav, pad, pad_left, relative_age_long, short_oid, str_width, wrap_text};
 
@@ -252,6 +252,8 @@ impl LogScreen {
             ("t", "tag"),
             ("v", "mark"),
             ("D", "diff marked → file"),
+            ("a", "stage files"),
+            ("m", "commit"),
             ("/", "filter"),
             ("b", "branches"),
             ("tab", "files"),
@@ -303,6 +305,17 @@ impl LogScreen {
             KeyCode::Esc if !self.marks.is_empty() => {
                 self.marks.clear();
                 return Some(Effect::Nothing);
+            }
+            KeyCode::Char('a') => {
+                return Some(match StageModal::new(&ctx.snap.status) {
+                    Some(m) => Effect::open(Modal::Stage(m)),
+                    None => Effect::Message("nothing to stage — the working tree is clean".into()),
+                });
+            }
+            KeyCode::Char('m') => {
+                let mut a = ctx.actions().commit();
+                a.key = KeyBinding::ch('m');
+                return Some(Effect::run(a, "m"));
             }
             KeyCode::Char('D') => {
                 return Some(match self.diff_file_action() {

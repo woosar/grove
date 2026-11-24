@@ -6,7 +6,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "grove", version, about)]
 pub struct Cli {
-    /// Repository to open (default: the current directory).
+    /// Repository to open directly; without it grove starts with the repository picker.
     pub path: Option<PathBuf>,
 
     /// Draw with ASCII glyphs and borders instead of Unicode.

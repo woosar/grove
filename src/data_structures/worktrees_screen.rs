@@ -44,6 +44,9 @@ impl WorktreesScreen {
         vec![
             ("n", "new"),
             ("⏎", "open"),
+            ("H", "reset hard"),
+            ("C", "clean"),
+            ("D", "discard all"),
             ("x", "remove"),
             ("X", "force remove"),
             ("p", "prune"),
@@ -207,7 +210,7 @@ impl WorktreesScreen {
         } else if wt.is_dirty() {
             (
                 wt.dirty.map(|d| d.describe()).unwrap_or_default(),
-                "Uncommitted work lives only in this directory. Commit or stash it there before removing the worktree.".to_string(),
+                "Uncommitted work lives only in this directory. Commit or stash it there before removing the worktree, or throw it away right here: H resets tracked files, C deletes untracked ones, D does both.".to_string(),
             )
         } else if wt.is_main {
             ("the main worktree".to_string(), "The original checkout; it holds the shared .git directory and can't be removed or moved.".to_string())
